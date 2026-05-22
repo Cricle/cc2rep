@@ -2,6 +2,10 @@
 
 轻量 Rust 代理：对外暴露 OpenAI Responses 风格接口，对内转发到上游 `chat/completions`。
 
+发布说明：
+
+- CI 产出的 Linux release 二进制使用 `musl` 静态链接，便于直接分发运行。
+
 ## 运行
 
 ```bash
