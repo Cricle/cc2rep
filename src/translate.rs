@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{sync::OnceLock, time::{SystemTime, UNIX_EPOCH}};
 
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -72,7 +72,6 @@ pub fn translate_request(
     let messages = build_messages(previous_messages, &input_items, instructions.as_deref())?;
     let mut upstream: Map<String, Value> = settings.upstream_body.clone().into_iter().collect();
     upstream.insert("model".to_owned(), Value::String(upstream_model.clone()));
-    upstream.insert("messages".to_owned(), Value::Array(messages.clone()));
     upstream.insert("stream".to_owned(), Value::Bool(stream));
 
     for field in [
@@ -117,11 +116,19 @@ pub fn translate_request(
         response_id,
     };
 
+    upstream.insert("messages".to_owned(), Value::Array(messages));
+
+    let request_messages = upstream
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
     Ok(TranslatedRequest {
         upstream_payload: Value::Object(upstream),
         context,
         input_items,
-        request_messages: messages,
+        request_messages,
     })
 }
 
@@ -968,32 +975,46 @@ fn extract_text_part(part: &Value) -> Result<String, ProxyError> {
 }
 
 fn extract_reasoning_content(message: &Map<String, Value>) -> String {
+    extract_first_reasoning(message)
+        .unwrap_or_default()
+}
+
+/// Extract the first non-empty reasoning value from a map with standard keys.
+/// Shared by stream delta extraction and message content extraction.
+pub fn extract_first_reasoning(map: &Map<String, Value>) -> Option<String> {
     for key in [
         "reasoning_content",
         "reasoning",
         "thinking",
         "reasoning_summary",
     ] {
-        if let Some(value) = message.get(key) {
+        if let Some(value) = map.get(key) {
             if let Some(reasoning) = flatten_reasoning_value(value) {
                 if !reasoning.is_empty() {
-                    return reasoning;
+                    return Some(reasoning);
                 }
             }
         }
     }
-    String::new()
+    None
 }
 
-fn flatten_reasoning_value(value: &Value) -> Option<String> {
+pub fn flatten_reasoning_value(value: &Value) -> Option<String> {
     match value {
-        Value::String(text) => Some(text.clone()),
+        Value::String(text) => {
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.clone())
+            }
+        }
         Value::Array(items) => {
-            let joined = items
-                .iter()
-                .filter_map(flatten_reasoning_value)
-                .collect::<Vec<_>>()
-                .join("");
+            let mut joined = String::new();
+            for item in items {
+                if let Some(text) = flatten_reasoning_value(item) {
+                    joined.push_str(&text);
+                }
+            }
             if joined.is_empty() {
                 None
             } else {
@@ -1058,13 +1079,16 @@ fn optional_u64(payload: &Map<String, Value>, key: &str) -> Result<Option<u64>, 
 }
 
 fn empty_usage() -> Value {
-    json!({
-        "input_tokens": 0,
-        "input_tokens_details": { "cached_tokens": 0 },
-        "output_tokens": 0,
-        "output_tokens_details": { "reasoning_tokens": 0 },
-        "total_tokens": 0,
-    })
+    static EMPTY: OnceLock<Value> = OnceLock::new();
+    EMPTY
+        .get_or_init(|| json!({
+            "input_tokens": 0,
+            "input_tokens_details": { "cached_tokens": 0 },
+            "output_tokens": 0,
+            "output_tokens_details": { "reasoning_tokens": 0 },
+            "total_tokens": 0,
+        }))
+        .clone()
 }
 
 pub fn unix_timestamp() -> i64 {

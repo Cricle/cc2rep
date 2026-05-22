@@ -56,7 +56,8 @@ fn default_request_timeout_seconds() -> f64 {
 
 impl Settings {
     pub fn load(path: &Path) -> Result<Self, ProxyError> {
-        let raw = fs::read_to_string(path).map_err(ProxyError::Io)?;
+        let raw = fs::read_to_string(path)
+            .map_err(|err| ProxyError::invalid_config(format!("failed to read config file: {err}")))?;
         let settings: Self = serde_json::from_str(&raw)
             .map_err(|err| ProxyError::invalid_config(format!("invalid config JSON: {err}")))?;
         settings.validate()?;

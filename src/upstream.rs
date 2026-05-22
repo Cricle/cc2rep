@@ -5,25 +5,28 @@ use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::{config::Settings, error::ProxyError};
 
 #[derive(Clone)]
 pub struct UpstreamClient {
-    settings: Arc<Settings>,
+    upstream_url: String,
+    headers: HeaderMap,
     http: Client,
 }
 
 impl UpstreamClient {
     pub fn new(settings: Arc<Settings>) -> Result<Self, ProxyError> {
+        let upstream_url = settings.upstream_url();
+        let headers = build_headers(&settings)?;
         let http = Client::builder()
             .timeout(Duration::from_secs_f64(settings.request_timeout_seconds))
             .build()
             .map_err(|err| {
                 ProxyError::invalid_config(format!("failed to build HTTP client: {err}"))
             })?;
-        Ok(Self { settings, http })
+        Ok(Self { upstream_url, headers, http })
     }
 
     pub async fn chat_json(&self, payload: &Value) -> Result<Value, ProxyError> {
@@ -39,23 +42,19 @@ impl UpstreamClient {
     }
 
     async fn send(&self, payload: &Value) -> Result<Response, ProxyError> {
-        let headers = self.build_headers()?;
-        debug!(
-            upstream_url = %self.settings.upstream_url(),
-            auth_header_name = %self.settings.upstream_api_key_header_name,
-            auth_header_prefix = %self.settings.upstream_api_key_prefix,
-            auth_header_value_masked = %mask_secret(&format!(
-                "{}{}",
-                self.settings.upstream_api_key_prefix, self.settings.upstream_api_key
-            )),
-            upstream_headers = ?sanitize_headers(&headers, &self.settings.upstream_api_key_header_name),
-            upstream_payload = %payload,
+        let model = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        info!(
+            upstream_url = %self.upstream_url,
+            model = %model,
             "sending request to upstream"
         );
         let request = self
             .http
-            .post(self.settings.upstream_url())
-            .headers(headers)
+            .post(&self.upstream_url)
+            .headers(self.headers.clone())
             .json(payload);
 
         let response = request.send().await.map_err(map_reqwest_error)?;
@@ -72,46 +71,46 @@ impl UpstreamClient {
             );
             return Err(ProxyError::from_upstream_body(status, body));
         }
-        debug!(upstream_status = %status, "upstream request succeeded");
+        info!(upstream_status = %status, "upstream request succeeded");
         Ok(response)
     }
+}
 
-    fn build_headers(&self) -> Result<HeaderMap, ProxyError> {
-        let mut headers = HeaderMap::new();
-        let auth_name: HeaderName =
-            self.settings
-                .upstream_api_key_header_name
-                .parse()
-                .map_err(|err| {
-                    ProxyError::invalid_config(format!(
-                        "invalid upstream_api_key_header_name: {err}"
-                    ))
-                })?;
-        let auth_value = format!(
-            "{}{}",
-            self.settings.upstream_api_key_prefix, self.settings.upstream_api_key
-        );
-        headers.insert(
-            auth_name,
-            HeaderValue::from_str(&auth_value).map_err(|err| {
-                ProxyError::invalid_config(format!("invalid upstream auth header value: {err}"))
-            })?,
-        );
-
-        for (name, value) in &self.settings.upstream_headers {
-            let header_name: HeaderName = name.parse().map_err(|err| {
-                ProxyError::invalid_config(format!("invalid upstream header `{name}`: {err}"))
-            })?;
-            let header_value = HeaderValue::from_str(value).map_err(|err| {
+fn build_headers(settings: &Settings) -> Result<HeaderMap, ProxyError> {
+    let mut headers = HeaderMap::new();
+    let auth_name: HeaderName =
+        settings
+            .upstream_api_key_header_name
+            .parse()
+            .map_err(|err| {
                 ProxyError::invalid_config(format!(
-                    "invalid upstream header value for `{name}`: {err}"
+                    "invalid upstream_api_key_header_name: {err}"
                 ))
             })?;
-            headers.insert(header_name, header_value);
-        }
+    let auth_value = format!(
+        "{}{}",
+        settings.upstream_api_key_prefix, settings.upstream_api_key
+    );
+    headers.insert(
+        auth_name,
+        HeaderValue::from_str(&auth_value).map_err(|err| {
+            ProxyError::invalid_config(format!("invalid upstream auth header value: {err}"))
+        })?,
+    );
 
-        Ok(headers)
+    for (name, value) in &settings.upstream_headers {
+        let header_name: HeaderName = name.parse().map_err(|err| {
+            ProxyError::invalid_config(format!("invalid upstream header `{name}`: {err}"))
+        })?;
+        let header_value = HeaderValue::from_str(value).map_err(|err| {
+            ProxyError::invalid_config(format!(
+                "invalid upstream header value for `{name}`: {err}"
+            ))
+        })?;
+        headers.insert(header_name, header_value);
     }
+
+    Ok(headers)
 }
 
 fn map_reqwest_error(error: reqwest::Error) -> ProxyError {
@@ -120,32 +119,4 @@ fn map_reqwest_error(error: reqwest::Error) -> ProxyError {
     } else {
         ProxyError::Transport(error.to_string())
     }
-}
-
-fn mask_secret(value: &str) -> String {
-    let chars: Vec<char> = value.chars().collect();
-    let len = chars.len();
-    if len <= 8 {
-        return "*".repeat(len.max(1));
-    }
-    let prefix: String = chars.iter().take(4).collect();
-    let suffix: String = chars.iter().skip(len - 4).collect();
-    format!("{prefix}***{suffix}")
-}
-
-fn sanitize_headers(headers: &HeaderMap, auth_header_name: &str) -> Vec<(String, String)> {
-    let auth_header_name = auth_header_name.to_ascii_lowercase();
-    headers
-        .iter()
-        .map(|(name, value)| {
-            let key = name.as_str().to_owned();
-            let raw = value.to_str().unwrap_or("<non-utf8>");
-            let sanitized = if key.eq_ignore_ascii_case(&auth_header_name) {
-                mask_secret(raw)
-            } else {
-                raw.to_owned()
-            };
-            (key, sanitized)
-        })
-        .collect()
 }

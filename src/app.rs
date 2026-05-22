@@ -21,7 +21,7 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::{
     config::Settings,
@@ -32,8 +32,9 @@ use crate::{
         AssistantTurn, RequestContext, ToolCall, build_cancelled_response, build_content_part,
         build_failed_response, build_function_call_item, build_history_message,
         build_in_progress_response, build_message_item, build_reasoning_item, build_response,
-        function_item_id, message_output_offset, parse_assistant_turn_from_response,
-        reasoning_output_offset, translate_request, unix_timestamp, usage_from_upstream,
+        extract_first_reasoning, function_item_id,
+        message_output_offset, parse_assistant_turn_from_response, reasoning_output_offset,
+        translate_request, unix_timestamp, usage_from_upstream,
     },
     upstream::UpstreamClient,
 };
@@ -78,7 +79,7 @@ pub fn build_router(settings: Settings) -> Router {
     let state = AppState {
         settings,
         upstream,
-        store: ResponseStore::new(),
+        store: ResponseStore::default(),
         inflight: InflightRegistry::default(),
     };
 
@@ -107,11 +108,6 @@ async fn create_response(
     Json(payload): Json<Value>,
 ) -> Result<Response, ProxyError> {
     authorize(&state.settings, &headers)?;
-    debug!(
-        request_auth_header = ?headers.get("authorization").and_then(|v| v.to_str().ok()).map(mask_auth_header),
-        request_payload = %payload,
-        "accepted incoming responses request"
-    );
 
     let object = payload
         .as_object()
@@ -125,12 +121,11 @@ async fn create_response(
 
     let previous_messages = load_previous_messages(&state.store, object).await?;
     let translated = translate_request(object, &state.settings, &report, &previous_messages)?;
-    debug!(
+    info!(
         response_id = %translated.context.response_id,
-        upstream_model = %translated.context.upstream_model,
+        model = %translated.context.upstream_model,
         stream = translated.context.stream,
-        translated_upstream_payload = %translated.upstream_payload,
-        "translated request for upstream"
+        "request accepted"
     );
 
     if translated.context.store {
@@ -172,6 +167,10 @@ async fn create_response(
         let usage = usage_from_upstream(upstream.get("usage"));
         let payload = build_response(&translated.context, &turn, usage, unix_timestamp());
         store_final_response(&state.store, &translated, payload.clone()).await?;
+        info!(
+            response_id = %translated.context.response_id,
+            "non-stream request completed"
+        );
         Ok((StatusCode::OK, Json(payload)).into_response())
     }
 }
@@ -343,7 +342,7 @@ fn stream_response(
             }
         }
 
-        let assistant_turn = state.assistant_turn();
+        let assistant_turn = state.take_turn();
 
         if cancelled {
             let cancelled_response = build_cancelled_response(
@@ -391,6 +390,10 @@ fn stream_response(
         );
         let _ = store_final_response(&store, &translated_for_store, final_response.clone()).await;
         let _ = inflight.finish(&response_id).await;
+        info!(
+            response_id = %response_id,
+            "stream request completed"
+        );
         yield Ok::<Event, Infallible>(json_event("response.completed", &mut sequence_number, json!({
             "type": "response.completed",
             "response": final_response,
@@ -457,6 +460,7 @@ fn authorize(settings: &Settings, headers: &HeaderMap) -> Result<(), ProxyError>
     if token == settings.proxy_api_key {
         Ok(())
     } else {
+        warn!("authentication failed: invalid proxy API key");
         Err(ProxyError::Unauthorized)
     }
 }
@@ -580,7 +584,7 @@ fn apply_stream_delta(
         return Ok(events);
     };
 
-    if let Some(reasoning_delta) = extract_stream_reasoning_delta(delta) {
+    if let Some(reasoning_delta) = extract_first_reasoning(delta) {
         if !reasoning_delta.is_empty() {
             if !state.reasoning_started {
                 state.reasoning_started = true;
@@ -621,7 +625,7 @@ fn apply_stream_delta(
         if !delta_text.is_empty() {
             if !state.message_started {
                 state.message_started = true;
-                let output_index = reasoning_output_offset(&state.assistant_turn());
+                let output_index = if state.has_reasoning() { 1 } else { 0 };
                 events.push(json_event(
                     "response.output_item.added",
                     sequence_number,
@@ -644,7 +648,7 @@ fn apply_stream_delta(
                 ));
             }
             state.text.push_str(&delta_text);
-            let output_index = reasoning_output_offset(&state.assistant_turn());
+            let output_index = if state.has_reasoning() { 1 } else { 0 };
             events.push(json_event(
                 "response.output_text.delta",
                 sequence_number,
@@ -666,7 +670,8 @@ fn apply_stream_delta(
                 .get("index")
                 .and_then(Value::as_u64)
                 .unwrap_or(state.tool_calls.len() as u64) as usize;
-            let output_offset = message_output_offset(&state.assistant_turn());
+            let output_offset = (if state.has_reasoning() { 1 } else { 0 })
+                + if state.has_message() { 1 } else { 0 };
             let entry = state
                 .tool_calls
                 .entry(index)
@@ -727,49 +732,6 @@ fn apply_stream_delta(
     }
 
     Ok(events)
-}
-
-fn extract_stream_reasoning_delta(delta: &serde_json::Map<String, Value>) -> Option<String> {
-    for key in [
-        "reasoning_content",
-        "reasoning",
-        "thinking",
-        "reasoning_summary",
-    ] {
-        if let Some(value) = delta.get(key) {
-            return flatten_reasoning_value(value);
-        }
-    }
-    None
-}
-
-fn flatten_reasoning_value(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(items) => {
-            let joined = items
-                .iter()
-                .filter_map(flatten_reasoning_value)
-                .collect::<Vec<_>>()
-                .join("");
-            if joined.is_empty() {
-                None
-            } else {
-                Some(joined)
-            }
-        }
-        Value::Object(map) => {
-            for key in ["text", "content", "summary", "reasoning_content"] {
-                if let Some(value) = map.get(key) {
-                    if let Some(text) = flatten_reasoning_value(value) {
-                        return Some(text);
-                    }
-                }
-            }
-            None
-        }
-        _ => None,
-    }
 }
 
 fn assistant_turn_from_output(output: &[Value]) -> Result<AssistantTurn, ProxyError> {
@@ -910,21 +872,28 @@ impl StreamState {
         }
     }
 
-    fn assistant_turn(&self) -> AssistantTurn {
-        let tool_calls = self
-            .tool_calls
-            .values()
-            .map(|tool_call| ToolCall {
-                call_id: tool_call.call_id.clone(),
-                name: tool_call.name.clone(),
-                arguments: tool_call.arguments.clone(),
-            })
-            .collect();
+    fn take_turn(&mut self) -> AssistantTurn {
         AssistantTurn {
-            reasoning: self.reasoning.clone(),
-            text: self.text.clone(),
-            tool_calls,
+            reasoning: std::mem::take(&mut self.reasoning),
+            text: std::mem::take(&mut self.text),
+            tool_calls: self
+                .tool_calls
+                .values()
+                .map(|tc| ToolCall {
+                    call_id: tc.call_id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                })
+                .collect(),
         }
+    }
+
+    fn has_reasoning(&self) -> bool {
+        !self.reasoning.is_empty()
+    }
+
+    fn has_message(&self) -> bool {
+        !self.text.is_empty() || self.tool_calls.is_empty()
     }
 }
 
@@ -946,8 +915,7 @@ impl SseParser {
         self.buffer.push_str(chunk);
         let mut events = Vec::new();
         while let Some(index) = self.buffer.find("\n\n") {
-            let raw = self.buffer[..index].to_owned();
-            self.buffer.drain(..index + 2);
+            let raw: String = self.buffer.drain(..index + 2).collect();
             if let Some(event) = parse_sse_event(&raw) {
                 events.push(event);
             }
@@ -967,20 +935,6 @@ fn parse_sse_event(raw: &str) -> Option<String> {
         None
     } else {
         Some(data_lines.join("\n"))
-    }
-}
-
-fn mask_auth_header(value: &str) -> String {
-    let token = value.strip_prefix("Bearer ").unwrap_or(value);
-    let masked = if token.len() <= 8 {
-        "*".repeat(token.len().max(1))
-    } else {
-        format!("{}***{}", &token[..4], &token[token.len() - 4..])
-    };
-    if value.starts_with("Bearer ") {
-        format!("Bearer {masked}")
-    } else {
-        masked
     }
 }
 

@@ -5,6 +5,7 @@ use axum::{
 use http::StatusCode;
 use serde_json::json;
 use thiserror::Error;
+use tracing::warn;
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -20,12 +21,8 @@ pub enum ProxyError {
     Transport(String),
     #[error("request to upstream timed out: {0}")]
     Timeout(String),
-    #[error("streaming error: {0}")]
-    Stream(String),
     #[error("internal error: {0}")]
     Internal(String),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
 }
 
 impl ProxyError {
@@ -72,8 +69,7 @@ impl ProxyError {
             Self::Upstream { status, .. } => *status,
             Self::Transport(_) => StatusCode::BAD_GATEWAY,
             Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
-            Self::Stream(_) => StatusCode::BAD_GATEWAY,
-            Self::Internal(_) | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -81,9 +77,9 @@ impl ProxyError {
         match self {
             Self::BadRequest(_) => "invalid_request_error",
             Self::Unauthorized => "authentication_error",
-            Self::InvalidConfig(_) | Self::Internal(_) | Self::Io(_) => "server_error",
+            Self::InvalidConfig(_) | Self::Internal(_) => "server_error",
             Self::Upstream { .. } => "upstream_error",
-            Self::Transport(_) | Self::Timeout(_) | Self::Stream(_) => "api_connection_error",
+            Self::Transport(_) | Self::Timeout(_) => "api_connection_error",
         }
     }
 
@@ -95,8 +91,7 @@ impl ProxyError {
             Self::Upstream { .. } => "upstream_error",
             Self::Transport(_) => "upstream_transport_error",
             Self::Timeout(_) => "upstream_timeout",
-            Self::Stream(_) => "upstream_stream_error",
-            Self::Internal(_) | Self::Io(_) => "internal_error",
+            Self::Internal(_) => "internal_error",
         }
     }
 }
@@ -105,6 +100,11 @@ impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let message = self.to_string();
+        if status.is_client_error() && !matches!(self, Self::BadRequest(_)) {
+            warn!(status = %status, error = %message, "request error");
+        } else if status.is_server_error() {
+            warn!(status = %status, error = %message, "server error");
+        }
         let body = json!({
             "error": {
                 "message": message,

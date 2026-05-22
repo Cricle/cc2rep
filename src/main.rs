@@ -25,6 +25,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let settings = Settings::load(&cli.config)?;
     let addr = settings.socket_addr()?;
+    info!(
+        upstream_url = %settings.upstream_url(),
+        upstream_model = %settings.upstream_model,
+        "proxy configured"
+    );
     let router = build_router(settings);
     let listener = TcpListener::bind(addr).await?;
 

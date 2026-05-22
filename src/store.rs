@@ -18,10 +18,6 @@ pub struct StoredResponse {
 }
 
 impl ResponseStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub async fn put(&self, response_id: String, stored: StoredResponse) -> Result<(), ProxyError> {
         self.inner.write().await.insert(response_id, stored);
         Ok(())
@@ -39,12 +35,11 @@ impl ResponseStore {
         &self,
         response_id: &str,
         response: Value,
-    ) -> Result<Option<()>, ProxyError> {
+    ) -> Result<(), ProxyError> {
         let mut guard = self.inner.write().await;
-        let Some(stored) = guard.get_mut(response_id) else {
-            return Ok(None);
-        };
-        stored.response = response;
-        Ok(Some(()))
+        if let Some(stored) = guard.get_mut(response_id) {
+            stored.response = response;
+        }
+        Ok(())
     }
 }
