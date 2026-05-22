@@ -250,7 +250,7 @@ async fn execute_non_stream_turn(
                     request_messages: translated.request_messages.clone(),
                 });
             };
-            append_tool_outputs(messages, &turn.tool_calls, &outputs);
+            append_tool_outputs(messages, &turn.tool_calls, &outputs, Some(&turn.reasoning));
         }
 
         last_upstream = state.upstream.chat_json(&upstream_payload).await?;
@@ -607,7 +607,12 @@ fn stream_response_with_auto_tools(
                             final_usage = usage;
                             break;
                         };
-                        append_tool_outputs(messages, &turn.tool_calls, &outputs);
+                        append_tool_outputs(
+                            messages,
+                            &turn.tool_calls,
+                            &outputs,
+                            Some(&turn.reasoning),
+                        );
                     }
 
                     if cancel_flag.load(Ordering::SeqCst) {
@@ -1841,6 +1846,7 @@ mod tests {
                             "choices": [{
                                 "message": {
                                     "role": "assistant",
+                                    "reasoning_content": "Check weather.",
                                     "content": null,
                                     "tool_calls": [{
                                         "id":"call_weather_1",
@@ -1855,6 +1861,7 @@ mod tests {
                         assert_eq!(messages.len(), 3);
                         assert_eq!(messages[1]["role"], "assistant");
                         assert_eq!(messages[1]["tool_calls"][0]["id"], "call_weather_1");
+                        assert_eq!(messages[1]["reasoning_content"], "Check weather.");
                         assert_eq!(messages[2]["role"], "tool");
                         assert_eq!(messages[2]["tool_call_id"], "call_weather_1");
                         assert_eq!(messages[2]["content"], "{\"temp\":26}");
@@ -1905,8 +1912,13 @@ mod tests {
             .to_bytes();
         let first_payload: Value = serde_json::from_slice(&first_body).expect("json");
         let response_id = first_payload["id"].as_str().expect("id").to_owned();
-        assert_eq!(first_payload["output"][0]["type"], "function_call");
-        assert_eq!(first_payload["output"][0]["call_id"], "call_weather_1");
+        let function_call = first_payload["output"]
+            .as_array()
+            .expect("output")
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("function call item");
+        assert_eq!(function_call["call_id"], "call_weather_1");
 
         let second = send(
             &router,
@@ -1958,6 +1970,7 @@ mod tests {
                             "choices": [{
                                 "message": {
                                     "role": "assistant",
+                                    "reasoning_content": "Call local tool.",
                                     "content": null,
                                     "tool_calls": [{
                                         "id":"call_echo_1",
@@ -1970,6 +1983,7 @@ mod tests {
                         }))
                     } else {
                         assert_eq!(messages.len(), 3);
+                        assert_eq!(messages[1]["reasoning_content"], "Call local tool.");
                         assert_eq!(messages[2]["role"], "tool");
                         let tool_output: Value =
                             serde_json::from_str(messages[2]["content"].as_str().expect("content"))

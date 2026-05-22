@@ -203,8 +203,9 @@ pub fn append_tool_outputs(
     messages: &mut Vec<Value>,
     tool_calls: &[ToolCall],
     outputs: &[ToolOutput],
+    reasoning: Option<&str>,
 ) {
-    messages.push(json!({
+    let mut assistant_message = json!({
         "role": "assistant",
         "content": null,
         "tool_calls": tool_calls.iter().map(|tool_call| {
@@ -217,7 +218,11 @@ pub fn append_tool_outputs(
                 }
             })
         }).collect::<Vec<_>>(),
-    }));
+    });
+    if let Some(reasoning) = reasoning.filter(|reasoning| !reasoning.is_empty()) {
+        assistant_message["reasoning_content"] = Value::String(reasoning.to_owned());
+    }
+    messages.push(assistant_message);
 
     let output_by_call_id: HashMap<&str, &str> = outputs
         .iter()
@@ -281,7 +286,7 @@ mod tests {
             call_id: "call_1".to_owned(),
             output: "{\"ok\":true}".to_owned(),
         }];
-        append_tool_outputs(&mut messages, &tool_calls, &outputs);
+        append_tool_outputs(&mut messages, &tool_calls, &outputs, None);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "assistant");
         assert_eq!(messages[1]["role"], "tool");
@@ -290,5 +295,9 @@ mod tests {
             output_items_from_tool_outputs(&outputs)[0]["type"],
             "function_call_output"
         );
+
+        let mut messages = vec![];
+        append_tool_outputs(&mut messages, &tool_calls, &outputs, Some("think"));
+        assert_eq!(messages[0]["reasoning_content"], "think");
     }
 }
