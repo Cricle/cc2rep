@@ -789,9 +789,8 @@ fn convert_tool(tool: &Value) -> Result<Vec<Value>, ProxyError> {
             }
             Ok(output)
         }
-        other => Err(ProxyError::bad_request(format!(
-            "unsupported tool type `{other}`"
-        ))),
+        "custom" => Ok(Vec::new()),
+        _ => Ok(Vec::new()),
     }
 }
 
