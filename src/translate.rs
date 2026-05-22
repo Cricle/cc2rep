@@ -1,4 +1,7 @@
-use std::{sync::OnceLock, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -975,8 +978,7 @@ fn extract_text_part(part: &Value) -> Result<String, ProxyError> {
 }
 
 fn extract_reasoning_content(message: &Map<String, Value>) -> String {
-    extract_first_reasoning(message)
-        .unwrap_or_default()
+    extract_first_reasoning(message).unwrap_or_default()
 }
 
 /// Extract the first non-empty reasoning value from a map with standard keys.
@@ -1081,13 +1083,15 @@ fn optional_u64(payload: &Map<String, Value>, key: &str) -> Result<Option<u64>, 
 fn empty_usage() -> Value {
     static EMPTY: OnceLock<Value> = OnceLock::new();
     EMPTY
-        .get_or_init(|| json!({
-            "input_tokens": 0,
-            "input_tokens_details": { "cached_tokens": 0 },
-            "output_tokens": 0,
-            "output_tokens_details": { "reasoning_tokens": 0 },
-            "total_tokens": 0,
-        }))
+        .get_or_init(|| {
+            json!({
+                "input_tokens": 0,
+                "input_tokens_details": { "cached_tokens": 0 },
+                "output_tokens": 0,
+                "output_tokens_details": { "reasoning_tokens": 0 },
+                "total_tokens": 0,
+            })
+        })
         .clone()
 }
 
@@ -1096,4 +1100,587 @@ pub fn unix_timestamp() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::protocol::analyze_protocol;
+
+    fn settings(image_input: bool) -> Settings {
+        Settings {
+            proxy_host: "127.0.0.1".to_owned(),
+            proxy_port: 8080,
+            proxy_api_key: "proxy-key".to_owned(),
+            upstream_base_url: "https://api.example.com".to_owned(),
+            upstream_chat_path: "/v1/chat/completions".to_owned(),
+            upstream_model: "upstream-model".to_owned(),
+            upstream_api_key: "upstream-key".to_owned(),
+            upstream_headers: Default::default(),
+            upstream_api_key_header_name: "Authorization".to_owned(),
+            upstream_api_key_prefix: "Bearer ".to_owned(),
+            request_timeout_seconds: 30.0,
+            strict_protocol: false,
+            upstream_supports_image_input: image_input,
+            upstream_body: [("seed".to_owned(), json!(7))].into_iter().collect(),
+            model_aliases: [("client-model".to_owned(), "aliased-model".to_owned())]
+                .into_iter()
+                .collect(),
+            local_tools: Default::default(),
+            max_auto_tool_rounds: 8,
+        }
+    }
+
+    fn context() -> RequestContext {
+        RequestContext {
+            response_id: "resp_1".to_owned(),
+            reasoning_id: "rs_1".to_owned(),
+            message_id: "msg_1".to_owned(),
+            created_at: 123,
+            client_model: "client-model".to_owned(),
+            upstream_model: "upstream-model".to_owned(),
+            stream: false,
+            store: true,
+            parallel_tool_calls: true,
+            instructions: Some("system".to_owned()),
+            metadata: json!({"meta":true}),
+            tool_choice: json!("auto"),
+            tools: vec![json!({"type":"function"})],
+            max_output_tokens: Some(55),
+        }
+    }
+
+    #[test]
+    fn translate_request_builds_upstream_payload_and_context() {
+        let payload = json!({
+            "model": "client-model",
+            "instructions": "be helpful",
+            "stream": true,
+            "store": false,
+            "parallel_tool_calls": false,
+            "metadata": {"request_id":"r1"},
+            "max_output_tokens": 99,
+            "temperature": 0.2,
+            "response_format": {"type":"json_object"},
+            "tool_choice": {"type":"function","name":"lookup"},
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "look up data",
+                    "parameters": {"type":"object","properties":{"q":{"type":"string"}}}
+                },
+                {
+                    "type": "namespace",
+                    "tools": [
+                        {"type":"function","function":{"name":"nested","parameters":{"type":"object"}}},
+                        {"type":"custom","name":"ignored"}
+                    ]
+                },
+                {"type":"custom","name":"ignored"}
+            ],
+            "input": [
+                {"type":"message","role":"developer","content":"dev"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
+                {"type":"function_call","call_id":"call_1","name":"lookup","arguments":{"q":"v"}},
+                {"type":"function_call_output","call_id":"call_1","output":{"result":1}}
+            ],
+            "reasoning": {"effort":"high"}
+        });
+        let object = payload.as_object().expect("object");
+        let report = analyze_protocol(object);
+
+        let translated =
+            translate_request(object, &settings(false), &report, &[]).expect("translate");
+        let upstream = translated.upstream_payload.as_object().expect("upstream");
+        assert_eq!(upstream["model"], "aliased-model");
+        assert_eq!(upstream["stream"], true);
+        assert_eq!(upstream["max_tokens"], 99);
+        assert_eq!(upstream["temperature"], 0.2);
+        assert_eq!(upstream["response_format"]["type"], "json_object");
+        assert_eq!(upstream["seed"], 7);
+        assert_eq!(upstream["tools"].as_array().expect("tools").len(), 2);
+        assert_eq!(upstream["tool_choice"]["function"]["name"], "lookup");
+        assert_eq!(translated.context.client_model, "client-model");
+        assert_eq!(translated.context.upstream_model, "aliased-model");
+        assert!(translated.context.stream);
+        assert!(!translated.context.store);
+        assert!(!translated.context.parallel_tool_calls);
+        assert_eq!(
+            translated.context.instructions.as_deref(),
+            Some("be helpful")
+        );
+        assert_eq!(
+            translated.context.metadata["response_proxy"]["compatibility"]["ignored_fields"][0],
+            "reasoning"
+        );
+        assert_eq!(translated.request_messages.len(), 5);
+        assert_eq!(translated.request_messages[0]["role"], "system");
+        assert_eq!(translated.request_messages[1]["role"], "system");
+        assert_eq!(translated.request_messages[2]["role"], "user");
+        assert_eq!(translated.request_messages[3]["role"], "assistant");
+        assert_eq!(translated.request_messages[4]["role"], "tool");
+    }
+
+    #[test]
+    fn translate_request_accepts_string_input_and_previous_messages() {
+        let payload = json!({"input":"hello"});
+        let object = payload.as_object().expect("object");
+        let report = analyze_protocol(object);
+        let translated = translate_request(
+            object,
+            &settings(false),
+            &report,
+            &[json!({"role":"assistant","content":"previous"})],
+        )
+        .expect("translate");
+
+        assert_eq!(translated.input_items[0]["role"], "user");
+        assert_eq!(translated.request_messages[0]["role"], "assistant");
+        assert_eq!(translated.request_messages[1]["role"], "user");
+        assert_eq!(translated.request_messages[1]["content"], "hello");
+    }
+
+    #[test]
+    fn response_builders_emit_expected_shapes() {
+        let context = context();
+        let turn = AssistantTurn {
+            text: "final".to_owned(),
+            reasoning: "think".to_owned(),
+            tool_calls: vec![ToolCall {
+                call_id: "call_1".to_owned(),
+                name: "lookup".to_owned(),
+                arguments: "{\"q\":\"v\"}".to_owned(),
+            }],
+        };
+
+        let response = build_response(&context, &turn, json!({"total_tokens":3}), 200);
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"].as_array().expect("output").len(), 3);
+        assert_eq!(response["output_text"], "final");
+
+        let cancelled = build_cancelled_response(&context, &turn, json!({"total_tokens":1}), 201);
+        assert_eq!(cancelled["status"], "cancelled");
+        assert_eq!(cancelled["incomplete_details"]["reason"], "cancelled");
+
+        let failed = build_failed_response(&context, &turn, 202, "boom", "stream_error");
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["error"]["message"], "boom");
+        assert_eq!(failed["error"]["code"], "stream_error");
+
+        let in_progress = build_in_progress_response(&context);
+        assert_eq!(in_progress["status"], "in_progress");
+        assert_eq!(in_progress["output"], json!([]));
+
+        assert_eq!(
+            build_reasoning_item(&context, "completed", "think")["summary"][0]["text"],
+            "think"
+        );
+        assert_eq!(
+            build_message_item(&context, "completed", "final")["content"][0]["text"],
+            "final"
+        );
+        assert_eq!(
+            build_function_call_item(&turn.tool_calls[0], "completed")["call_id"],
+            "call_1"
+        );
+        assert_eq!(build_content_part("x")["type"], "output_text");
+        assert_eq!(function_item_id("call_1"), "fc_call_1");
+        assert_eq!(reasoning_output_offset(&turn), 1);
+        assert_eq!(message_output_offset(&turn), 2);
+
+        let no_reasoning = AssistantTurn {
+            reasoning: String::new(),
+            text: String::new(),
+            tool_calls: vec![],
+        };
+        assert_eq!(reasoning_output_offset(&no_reasoning), 0);
+        assert_eq!(message_output_offset(&no_reasoning), 1);
+    }
+
+    #[test]
+    fn usage_and_history_and_parsing_helpers_work() {
+        let usage = usage_from_upstream(Some(&json!({
+            "prompt_tokens": 3,
+            "completion_tokens": 4,
+            "prompt_tokens_details": {"cached_tokens": 1},
+            "completion_tokens_details": {"reasoning_tokens": 2}
+        })));
+        assert_eq!(usage["input_tokens"], 3);
+        assert_eq!(usage["output_tokens"], 4);
+        assert_eq!(usage["total_tokens"], 7);
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 1);
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 2);
+        assert_eq!(usage_from_upstream(None)["total_tokens"], 0);
+
+        let turn = AssistantTurn {
+            text: "answer".to_owned(),
+            reasoning: "think".to_owned(),
+            tool_calls: vec![ToolCall {
+                call_id: "call_1".to_owned(),
+                name: "lookup".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+        };
+        let history = build_history_message(&turn).expect("history");
+        assert_eq!(history["role"], "assistant");
+        assert_eq!(history["reasoning_content"], "think");
+        assert_eq!(history["tool_calls"][0]["id"], "call_1");
+        assert!(build_history_message(&AssistantTurn::default()).is_none());
+
+        let upstream = json!({
+            "choices": [{
+                "message": {
+                    "content": [{"type":"text","text":"hello"},{"type":"input_image","image_url":{"url":"x"}}],
+                    "reasoning": [{"text":"step "},"done"],
+                    "tool_calls": [{
+                        "id":"call_1",
+                        "function":{"name":"lookup","arguments":{"x":1}}
+                    }]
+                }
+            }]
+        });
+        let parsed = parse_assistant_turn_from_response(&upstream).expect("parse");
+        assert_eq!(parsed.text, "hello");
+        assert_eq!(parsed.reasoning, "step done");
+        assert_eq!(parsed.tool_calls[0].arguments, "{\"x\":1}");
+    }
+
+    #[test]
+    fn extraction_helpers_cover_supported_shapes() {
+        assert_eq!(extract_message_text(&Value::Null).expect("null"), "");
+        assert_eq!(extract_message_text(&json!("text")).expect("text"), "text");
+        assert_eq!(
+            extract_message_text(&json!({"text":"inline"})).expect("object"),
+            "inline"
+        );
+        assert_eq!(
+            extract_message_text(&json!([{"type":"text","text":"a"},"b"])).expect("array"),
+            "ab"
+        );
+
+        let reasoning = extract_first_reasoning(
+            json!({"thinking":[{"content":[{"text":"a"},{"summary":"b"}]}]})
+                .as_object()
+                .expect("object"),
+        );
+        assert_eq!(reasoning.as_deref(), Some("ab"));
+        assert_eq!(
+            flatten_reasoning_value(&json!(["a",{"text":"b"},{"summary":"c"}])),
+            Some("abc".to_owned())
+        );
+        assert_eq!(flatten_reasoning_value(&json!("")), None);
+        assert_eq!(
+            extract_first_reasoning(json!({}).as_object().expect("obj")),
+            None
+        );
+    }
+
+    #[test]
+    fn translate_request_rejects_invalid_payload_shapes() {
+        let cases = [
+            json!({"input":"hi","stream":"x"}),
+            json!({"input":"hi","store":"x"}),
+            json!({"input":"hi","parallel_tool_calls":"x"}),
+            json!({"input":"hi","max_output_tokens":"x"}),
+            json!({"input":"hi","max_output_tokens":-1}),
+            json!({"input":"hi","metadata":[]}),
+            json!({"input":"hi","text":{"format":{"type":"json_schema"}}}),
+            json!({"input":[1]}),
+            json!({"input":{"type":"message","content":"x"}}),
+            json!({"input":{"type":"message","role":"user"}}),
+            json!({"input":{"type":"text"}}),
+            json!({"input":{"type":"function_call","call_id":"c","arguments":{}}}),
+            json!({"input":{"type":"function_call","name":"n","arguments":{}}}),
+            json!({"input":{"type":"function_call","name":"n","call_id":"c"}}),
+            json!({"input":{"type":"function_call_output","call_id":"c"}}),
+            json!({"input":{"type":"input_image","image_url":"https://x"}}),
+            json!({"input":{"type":"unknown"}}),
+            json!({"input":{"type":"message","role":"user","content":1}}),
+            json!({"input":{"type":"message","role":"user","content":[1]}}),
+            json!({"input":{"type":"message","role":"user","content":[{"type":"text"}]}}),
+            json!({"input":{"type":"message","role":"user","content":[{"type":"input_image"}]}}),
+            json!({"input":{"type":"message","role":"weird","content":"x"}}),
+            json!({"input":[]}),
+            json!({"input":"hi","tools":[1]}),
+            json!({"input":"hi","tools":[{"type":"function"}]}),
+            json!({"input":"hi","tools":[{"type":"namespace"}]}),
+        ];
+
+        for payload in cases {
+            let object = payload.as_object().expect("object");
+            let report = analyze_protocol(object);
+            assert!(
+                translate_request(object, &settings(false), &report, &[]).is_err(),
+                "payload should fail: {payload}"
+            );
+        }
+
+        let payload = json!({
+            "input":"hi",
+            "tools":[{"type":"function","name":"lookup"}],
+            "tool_choice":{"type":"custom","name":"x"}
+        });
+        let object = payload.as_object().expect("object");
+        let report = analyze_protocol(object);
+        assert!(translate_request(object, &settings(false), &report, &[]).is_err());
+
+        let payload = json!({
+            "input":"hi",
+            "tools":[{"type":"function","name":"lookup"}],
+            "tool_choice":{"type":"function"}
+        });
+        let object = payload.as_object().expect("object");
+        let report = analyze_protocol(object);
+        assert!(translate_request(object, &settings(false), &report, &[]).is_err());
+    }
+
+    #[test]
+    fn translate_request_supports_image_and_object_inputs() {
+        let payload = json!({
+            "input": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type":"input_text","text":"look"},
+                    {"type":"input_image","image_url":{"url":"https://img"}}
+                ]
+            }
+        });
+        let object = payload.as_object().expect("object");
+        let report = analyze_protocol(object);
+        let translated =
+            translate_request(object, &settings(true), &report, &[]).expect("translate");
+        assert!(translated.request_messages[0]["content"].is_array());
+        assert_eq!(
+            translated.request_messages[0]["content"][1]["type"],
+            "image_url"
+        );
+    }
+
+    #[test]
+    fn parse_assistant_turn_reports_invalid_upstream_shapes() {
+        assert!(parse_assistant_turn_from_response(&json!({})).is_err());
+        assert!(parse_assistant_turn_from_response(&json!({"choices":[{}]})).is_err());
+        assert!(
+            parse_assistant_turn_from_response(&json!({
+                "choices":[{"message":{"content":1}}]
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_assistant_turn_from_response(&json!({
+                "choices":[{"message":{"tool_calls":[1]}}]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unix_timestamp_is_non_negative() {
+        assert!(unix_timestamp() >= 0);
+    }
+
+    #[test]
+    fn helper_edge_cases_are_covered() {
+        let tool_only = AssistantTurn {
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![ToolCall {
+                call_id: "call_1".to_owned(),
+                name: "lookup".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+        };
+        let history = build_history_message(&tool_only).expect("history");
+        assert_eq!(history["content"], Value::Null);
+        assert_eq!(history["tool_calls"][0]["id"], "call_1");
+        assert_eq!(message_output_offset(&tool_only), 0);
+
+        assert!(extract_message_text(&json!({"no_text":true})).is_err());
+        assert!(extract_message_text(&json!(1)).is_err());
+        assert_eq!(
+            normalize_input_items(None, &settings(false))
+                .unwrap_err()
+                .to_string(),
+            "input is required"
+        );
+        assert!(normalize_input_items(Some(&json!(1)), &settings(false)).is_err());
+        assert_eq!(
+            normalize_input_item(&json!({"role":"user","content":"x"}), &settings(false))
+                .expect("message")["type"],
+            "message"
+        );
+        assert_eq!(
+            normalize_input_item(
+                &json!({"type":"function_call_output","id":"call_1","content":{"ok":true}}),
+                &settings(false)
+            )
+            .expect("tool output")["output"],
+            "{\"ok\":true}"
+        );
+        assert!(
+            normalize_input_item(
+                &json!({"type":"function_call_output","output":"x"}),
+                &settings(false)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            normalize_input_item(&json!({"type":"text","text":"inline"}), &settings(false))
+                .expect("text item")["content"][0]["text"],
+            "inline"
+        );
+        assert_eq!(
+            normalize_input_item(
+                &json!({"type":"image_url","url":"https://img"}),
+                &settings(true)
+            )
+            .expect("image")["content"][0]["image_url"]["url"],
+            "https://img"
+        );
+
+        assert_eq!(
+            normalize_content_parts(&json!({"type":"text","text":"x"}), &settings(false))
+                .expect("object part")[0]["text"],
+            "x"
+        );
+        assert_eq!(
+            normalize_content_part(&json!("plain"), &settings(false)).expect("string part")["text"],
+            "plain"
+        );
+        assert_eq!(
+            normalize_content_part(
+                &json!({"type":"image_url","url":"https://img"}),
+                &settings(true)
+            )
+            .expect("image part")["image_url"]["url"],
+            "https://img"
+        );
+        assert!(normalize_content_part(&json!({"type":"custom"}), &settings(false)).is_err());
+
+        let messages = build_messages(
+            &[],
+            &[json!({"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"})],
+            None,
+        )
+        .expect("messages");
+        assert_eq!(messages[0]["role"], "assistant");
+        assert!(build_messages(&[], &[json!({"type":"custom"})], None).is_err());
+
+        assert_eq!(
+            upstream_content_from_parts(&[json!({"type":"other","text":"fallback"})])[0]["text"],
+            "fallback"
+        );
+        let mut messages = vec![];
+        let mut pending = vec![];
+        flush_pending_tool_calls(&mut messages, &mut pending);
+        assert!(messages.is_empty());
+
+        assert_eq!(normalize_tools(None).expect("none"), Vec::<Value>::new());
+        assert!(convert_tool(&json!(1)).is_err());
+        assert_eq!(
+            convert_tool(&json!({"type":"other"})).expect("ignored"),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            convert_function_tool(
+                json!({"function":{"name":"lookup"}})
+                    .as_object()
+                    .expect("object")
+            )
+            .expect("function")["function"]["parameters"]["type"],
+            "object"
+        );
+
+        assert_eq!(
+            normalize_tool_choice(None).expect("none"),
+            Value::String("auto".to_owned())
+        );
+        assert_eq!(
+            normalize_tool_choice(Some(&json!("required"))).expect("required"),
+            Value::String("required".to_owned())
+        );
+        assert_eq!(
+            normalize_tool_choice(Some(&json!({"type":"function","name":"lookup"})))
+                .expect("object name")["function"]["name"],
+            "lookup"
+        );
+        assert!(normalize_tool_choice(Some(&json!("weird"))).is_err());
+        assert_eq!(
+            normalize_tool_choice(Some(
+                &json!({"type":"function","function":{"name":"lookup"}})
+            ))
+            .expect("object")["function"]["name"],
+            "lookup"
+        );
+        assert!(normalize_tool_choice(Some(&json!(1))).is_err());
+
+        assert!(parse_tool_calls(None).expect("none").is_empty());
+        let generated = parse_tool_calls(Some(&json!([{
+            "function":{"name":"lookup","arguments":null}
+        }])))
+        .expect("generated");
+        assert!(generated[0].call_id.starts_with("call_"));
+        assert_eq!(generated[0].arguments, "");
+        assert!(parse_tool_calls(Some(&json!([{"function":{"name":"lookup"}}]))).is_err());
+        assert!(parse_tool_calls(Some(&json!([{"function":{"arguments":"{}"}}]))).is_err());
+
+        assert_eq!(normalized_image_part(json!(7))["image_url"]["url"], "7");
+        assert_eq!(stringify_json_value(&Value::Null).expect("null"), "");
+        assert!(extract_text_part(&json!({"type":"text"})).is_err());
+        assert_eq!(
+            extract_text_part(&json!({"type":"image_url","image_url":{"url":"x"}})).expect("image"),
+            ""
+        );
+        assert!(extract_text_part(&json!({"type":"custom"})).is_err());
+
+        let reasoning_message = json!({"reasoning_summary":"x"});
+        assert_eq!(
+            extract_reasoning_content(reasoning_message.as_object().expect("object")),
+            "x"
+        );
+        assert_eq!(
+            extract_first_reasoning(
+                json!({"reasoning_content":["",{"text":"x"}]})
+                    .as_object()
+                    .expect("object")
+            )
+            .as_deref(),
+            Some("x")
+        );
+        assert_eq!(
+            extract_first_reasoning(
+                json!({"reasoning_content":[""]})
+                    .as_object()
+                    .expect("object")
+            ),
+            None
+        );
+        assert_eq!(flatten_reasoning_value(&json!([])), None);
+        assert_eq!(flatten_reasoning_value(&json!([null])), None);
+        assert_eq!(flatten_reasoning_value(&json!({"unknown":"x"})), None);
+        assert_eq!(
+            flatten_reasoning_value(&json!({"reasoning_content":"x"})),
+            Some("x".to_owned())
+        );
+        assert_eq!(
+            flatten_reasoning_value(&json!({"content":{"text":"x"}})),
+            Some("x".to_owned())
+        );
+
+        let text_missing_type = json!({"text":{}});
+        assert!(validate_text_format(text_missing_type.as_object().expect("obj")).is_ok());
+        let no_text_field = json!({});
+        assert!(validate_text_format(no_text_field.as_object().expect("obj")).is_ok());
+        let plain_text_type = json!({"text":{"format":{"type":"text"}}});
+        assert!(validate_text_format(plain_text_type.as_object().expect("obj")).is_ok());
+        let misc = json!({"model":1,"stream":null,"max_output_tokens":null});
+        let misc = misc.as_object().expect("obj");
+        assert_eq!(optional_string(misc, "model"), None);
+        assert_eq!(optional_bool(misc, "stream").expect("stream"), None);
+        assert_eq!(optional_u64(misc, "max_output_tokens").expect("max"), None);
+    }
 }

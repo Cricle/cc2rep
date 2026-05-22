@@ -43,3 +43,53 @@ impl ResponseStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn stored_response(text: &str) -> StoredResponse {
+        StoredResponse {
+            response: json!({"id":"resp_1","output_text":text}),
+            input_items: vec![json!({"type":"message"})],
+            request_messages: vec![json!({"role":"user","content":"hi"})],
+        }
+    }
+
+    #[tokio::test]
+    async fn put_get_update_delete_round_trip() {
+        let store = ResponseStore::default();
+        store
+            .put("resp_1".to_owned(), stored_response("first"))
+            .await
+            .expect("put");
+
+        let loaded = store.get("resp_1").await.expect("get").expect("stored");
+        assert_eq!(loaded.response["output_text"], "first");
+        assert_eq!(loaded.input_items.len(), 1);
+        assert_eq!(loaded.request_messages.len(), 1);
+
+        store
+            .update_response("resp_1", json!({"id":"resp_1","output_text":"updated"}))
+            .await
+            .expect("update");
+        let updated = store.get("resp_1").await.expect("get").expect("stored");
+        assert_eq!(updated.response["output_text"], "updated");
+
+        let deleted = store.delete("resp_1").await.expect("delete");
+        assert!(deleted.is_some());
+        assert!(store.get("resp_1").await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_missing_entries_are_noops() {
+        let store = ResponseStore::default();
+        store
+            .update_response("missing", json!({"id":"missing"}))
+            .await
+            .expect("update");
+        assert!(store.delete("missing").await.expect("delete").is_none());
+    }
+}

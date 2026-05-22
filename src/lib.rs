@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod protocol;
 pub mod store;
+pub mod tools;
 pub mod translate;
 pub mod upstream;
 

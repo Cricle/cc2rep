@@ -12,6 +12,22 @@
   "upstream_api_key_prefix": "Bearer ",
   "request_timeout_seconds": 120.0,
   "strict_protocol": false,
+  "upstream_supports_image_input": false,
+  "max_auto_tool_rounds": 8,
+  "local_tools": {
+    "echo_json": {
+      "command": "sh",
+      "args": [
+        "-lc",
+        "cat"
+      ],
+      "env": {},
+      "workdir": null,
+      "timeout_seconds": 10.0,
+      "stdin_json": true,
+      "output_json": true
+    }
+  },
   "model_aliases": {
     "gpt-5-codex": "deepseek-chat"
   }

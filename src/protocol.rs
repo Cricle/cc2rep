@@ -147,3 +147,65 @@ pub fn analyze_protocol(payload: &Map<String, Value>) -> ProtocolReport {
         unsupported_fields: unsupported,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyze_protocol_categorizes_and_sorts_fields() {
+        let payload = serde_json::from_value::<Map<String, Value>>(json!({
+            "zzz": 1,
+            "input": "hi",
+            "store": true,
+            "parallel_tool_calls": true,
+            "reasoning": {},
+            "background": true,
+            "model": "m"
+        }))
+        .expect("map");
+
+        let report = analyze_protocol(&payload);
+        assert_eq!(report.supported_fields, vec!["input", "model"]);
+        assert_eq!(report.emulated_fields, vec!["parallel_tool_calls", "store"]);
+        assert_eq!(report.ignored_fields, vec!["background", "reasoning"]);
+        assert_eq!(report.unsupported_fields, vec!["zzz"]);
+        assert!(report.has_compatibility_notes());
+    }
+
+    #[test]
+    fn strict_error_and_metadata_fragment_reflect_report_contents() {
+        let payload = serde_json::from_value::<Map<String, Value>>(json!({
+            "input": "hi",
+            "prompt": "ignored",
+            "unknown": true
+        }))
+        .expect("map");
+        let report = analyze_protocol(&payload);
+
+        let error = report.strict_error().expect("strict error");
+        assert!(error.contains("prompt"));
+        assert!(error.contains("unknown"));
+
+        let fragment = report.metadata_fragment();
+        assert_eq!(fragment["compatibility"]["mode"], "chat_completions_bridge");
+        assert_eq!(fragment["compatibility"]["supported_fields"][0], "input");
+        assert_eq!(fragment["compatibility"]["ignored_fields"][0], "prompt");
+        assert_eq!(
+            fragment["compatibility"]["unsupported_fields"][0],
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn strict_error_is_none_without_blocked_fields() {
+        let payload = serde_json::from_value::<Map<String, Value>>(json!({
+            "input": "hi",
+            "model": "m",
+            "store": true
+        }))
+        .expect("map");
+        let report = analyze_protocol(&payload);
+        assert_eq!(report.strict_error(), None);
+    }
+}
