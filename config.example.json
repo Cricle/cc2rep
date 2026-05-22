@@ -1,0 +1,17 @@
+{
+  "proxy_host": "127.0.0.1",
+  "proxy_port": 8800,
+  "proxy_api_key": "proxy-secret",
+  "upstream_base_url": "https://api.example.com",
+  "upstream_chat_path": "/v1/chat/completions",
+  "upstream_model": "deepseek-chat",
+  "upstream_api_key": "upstream-secret",
+  "upstream_headers": {},
+  "upstream_api_key_header_name": "Authorization",
+  "upstream_api_key_prefix": "Bearer ",
+  "request_timeout_seconds": 120.0,
+  "strict_protocol": false,
+  "model_aliases": {
+    "gpt-5-codex": "deepseek-chat"
+  }
+}
