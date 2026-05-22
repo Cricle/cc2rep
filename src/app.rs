@@ -983,6 +983,7 @@ mod tests {
             request_timeout_seconds: 10.0,
             strict_protocol: false,
             upstream_supports_image_input: image_input,
+            upstream_body: Default::default(),
             model_aliases: [("gpt-5-codex".to_owned(), "deepseek-chat".to_owned())]
                 .into_iter()
                 .collect(),

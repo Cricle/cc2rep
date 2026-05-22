@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::error::ProxyError;
 
@@ -31,6 +32,8 @@ pub struct Settings {
     pub strict_protocol: bool,
     #[serde(default)]
     pub upstream_supports_image_input: bool,
+    #[serde(default)]
+    pub upstream_body: HashMap<String, Value>,
     #[serde(default)]
     pub model_aliases: HashMap<String, String>,
 }

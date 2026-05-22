@@ -70,7 +70,7 @@ pub fn translate_request(
         .unwrap_or_else(|| Value::String("auto".to_owned()));
 
     let messages = build_messages(previous_messages, &input_items, instructions.as_deref())?;
-    let mut upstream = Map::new();
+    let mut upstream: Map<String, Value> = settings.upstream_body.clone().into_iter().collect();
     upstream.insert("model".to_owned(), Value::String(upstream_model.clone()));
     upstream.insert("messages".to_owned(), Value::Array(messages.clone()));
     upstream.insert("stream".to_owned(), Value::Bool(stream));
