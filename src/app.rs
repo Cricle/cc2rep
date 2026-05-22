@@ -21,7 +21,7 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
     config::Settings,
@@ -107,6 +107,11 @@ async fn create_response(
     Json(payload): Json<Value>,
 ) -> Result<Response, ProxyError> {
     authorize(&state.settings, &headers)?;
+    debug!(
+        request_auth_header = ?headers.get("authorization").and_then(|v| v.to_str().ok()).map(mask_auth_header),
+        request_payload = %payload,
+        "accepted incoming responses request"
+    );
 
     let object = payload
         .as_object()
@@ -120,6 +125,13 @@ async fn create_response(
 
     let previous_messages = load_previous_messages(&state.store, object).await?;
     let translated = translate_request(object, &state.settings, &report, &previous_messages)?;
+    debug!(
+        response_id = %translated.context.response_id,
+        upstream_model = %translated.context.upstream_model,
+        stream = translated.context.stream,
+        translated_upstream_payload = %translated.upstream_payload,
+        "translated request for upstream"
+    );
 
     if translated.context.store {
         state
@@ -955,6 +967,20 @@ fn parse_sse_event(raw: &str) -> Option<String> {
         None
     } else {
         Some(data_lines.join("\n"))
+    }
+}
+
+fn mask_auth_header(value: &str) -> String {
+    let token = value.strip_prefix("Bearer ").unwrap_or(value);
+    let masked = if token.len() <= 8 {
+        "*".repeat(token.len().max(1))
+    } else {
+        format!("{}***{}", &token[..4], &token[token.len() - 4..])
+    };
+    if value.starts_with("Bearer ") {
+        format!("Bearer {masked}")
+    } else {
+        masked
     }
 }
 

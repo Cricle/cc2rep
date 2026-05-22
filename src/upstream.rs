@@ -5,6 +5,7 @@ use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use serde_json::Value;
+use tracing::{debug, warn};
 
 use crate::{config::Settings, error::ProxyError};
 
@@ -38,10 +39,23 @@ impl UpstreamClient {
     }
 
     async fn send(&self, payload: &Value) -> Result<Response, ProxyError> {
+        let headers = self.build_headers()?;
+        debug!(
+            upstream_url = %self.settings.upstream_url(),
+            auth_header_name = %self.settings.upstream_api_key_header_name,
+            auth_header_prefix = %self.settings.upstream_api_key_prefix,
+            auth_header_value_masked = %mask_secret(&format!(
+                "{}{}",
+                self.settings.upstream_api_key_prefix, self.settings.upstream_api_key
+            )),
+            upstream_headers = ?sanitize_headers(&headers, &self.settings.upstream_api_key_header_name),
+            upstream_payload = %payload,
+            "sending request to upstream"
+        );
         let request = self
             .http
             .post(self.settings.upstream_url())
-            .headers(self.build_headers()?)
+            .headers(headers)
             .json(payload);
 
         let response = request.send().await.map_err(map_reqwest_error)?;
@@ -51,8 +65,14 @@ impl UpstreamClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "failed to read upstream error body".to_owned());
+            warn!(
+                upstream_status = %status,
+                upstream_error_body = %body,
+                "upstream request failed"
+            );
             return Err(ProxyError::from_upstream_body(status, body));
         }
+        debug!(upstream_status = %status, "upstream request succeeded");
         Ok(response)
     }
 
@@ -100,4 +120,32 @@ fn map_reqwest_error(error: reqwest::Error) -> ProxyError {
     } else {
         ProxyError::Transport(error.to_string())
     }
+}
+
+fn mask_secret(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let len = chars.len();
+    if len <= 8 {
+        return "*".repeat(len.max(1));
+    }
+    let prefix: String = chars.iter().take(4).collect();
+    let suffix: String = chars.iter().skip(len - 4).collect();
+    format!("{prefix}***{suffix}")
+}
+
+fn sanitize_headers(headers: &HeaderMap, auth_header_name: &str) -> Vec<(String, String)> {
+    let auth_header_name = auth_header_name.to_ascii_lowercase();
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let key = name.as_str().to_owned();
+            let raw = value.to_str().unwrap_or("<non-utf8>");
+            let sanitized = if key.eq_ignore_ascii_case(&auth_header_name) {
+                mask_secret(raw)
+            } else {
+                raw.to_owned()
+            };
+            (key, sanitized)
+        })
+        .collect()
 }
