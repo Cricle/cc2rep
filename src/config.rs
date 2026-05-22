@@ -33,6 +33,10 @@ pub struct Settings {
     #[serde(default)]
     pub upstream_supports_image_input: bool,
     #[serde(default)]
+    pub drop_input_reasoning: bool,
+    #[serde(default)]
+    pub drop_tools: bool,
+    #[serde(default)]
     pub upstream_body: HashMap<String, Value>,
     #[serde(default)]
     pub model_aliases: HashMap<String, String>,
@@ -202,6 +206,8 @@ mod tests {
             request_timeout_seconds: 30.0,
             strict_protocol: false,
             upstream_supports_image_input: false,
+            drop_input_reasoning: false,
+            drop_tools: false,
             upstream_body: [("seed".to_owned(), json!(1))].into_iter().collect(),
             model_aliases: [("client-model".to_owned(), "aliased-model".to_owned())]
                 .into_iter()

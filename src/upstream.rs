@@ -143,6 +143,8 @@ mod tests {
             request_timeout_seconds: 0.1,
             strict_protocol: false,
             upstream_supports_image_input: false,
+            drop_input_reasoning: false,
+            drop_tools: false,
             upstream_body: Default::default(),
             model_aliases: Default::default(),
             local_tools: Default::default(),

@@ -66,13 +66,26 @@ pub fn translate_request(
     let metadata = build_metadata(payload.get("metadata"), report)?;
     let max_output_tokens = optional_u64(payload, "max_output_tokens")?;
     let input_items = normalize_input_items(payload.get("input"), settings)?;
-    let tools = normalize_tools(payload.get("tools"))?;
-    let tool_choice = payload
-        .get("tool_choice")
-        .cloned()
-        .unwrap_or_else(|| Value::String("auto".to_owned()));
+    let tools = if settings.drop_tools {
+        Vec::new()
+    } else {
+        normalize_tools(payload.get("tools"))?
+    };
+    let tool_choice = if settings.drop_tools {
+        Value::String("none".to_owned())
+    } else {
+        payload
+            .get("tool_choice")
+            .cloned()
+            .unwrap_or_else(|| Value::String("auto".to_owned()))
+    };
 
-    let messages = build_messages(previous_messages, &input_items, instructions.as_deref())?;
+    let messages = build_messages(
+        previous_messages,
+        &input_items,
+        instructions.as_deref(),
+        settings,
+    )?;
     let mut upstream: Map<String, Value> = settings.upstream_body.clone().into_iter().collect();
     upstream.insert("model".to_owned(), Value::String(upstream_model.clone()));
     upstream.insert("stream".to_owned(), Value::Bool(stream));
@@ -520,6 +533,11 @@ fn normalize_input_item(item: &Value, settings: &Settings) -> Result<Value, Prox
                 .ok_or_else(|| ProxyError::bad_request("text item is missing text"))?;
             Ok(normalized_message("user", vec![normalized_text_part(text)]))
         }
+        Some("reasoning") if settings.drop_input_reasoning => Ok(json!({
+            "type": "reasoning",
+            "summary": Value::Null,
+            "text": "",
+        })),
         Some("reasoning") => Ok(json!({
             "type": "reasoning",
             "summary": map.get("summary").cloned().unwrap_or(Value::Null),
@@ -654,6 +672,7 @@ fn build_messages(
     previous_messages: &[Value],
     input_items: &[Value],
     instructions: Option<&str>,
+    settings: &Settings,
 ) -> Result<Vec<Value>, ProxyError> {
     let mut messages = previous_messages.to_vec();
     if let Some(instructions) = instructions {
@@ -664,6 +683,7 @@ fn build_messages(
     }
 
     let mut pending_tool_calls = Vec::new();
+    let mut pending_reasoning = String::new();
     for item in input_items {
         let map = item
             .as_object()
@@ -671,7 +691,11 @@ fn build_messages(
         let item_type = map.get("type").and_then(Value::as_str).unwrap_or("message");
         match item_type {
             "message" => {
-                flush_pending_tool_calls(&mut messages, &mut pending_tool_calls);
+                flush_pending_tool_calls(
+                    &mut messages,
+                    &mut pending_tool_calls,
+                    &mut pending_reasoning,
+                );
                 let role = map
                     .get("role")
                     .and_then(Value::as_str)
@@ -695,8 +719,23 @@ fn build_messages(
                     "content": upstream_content_from_parts(content),
                 }));
             }
-            "reasoning" => {}
+            "reasoning" => {
+                if settings.drop_input_reasoning || pending_tool_calls.is_empty() {
+                    continue;
+                }
+                let reasoning = map
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or("");
+                if !reasoning.is_empty() {
+                    pending_reasoning.push_str(reasoning);
+                }
+            }
             "function_call" => {
+                if settings.drop_tools {
+                    continue;
+                }
                 pending_tool_calls.push(json!({
                     "id": map["call_id"],
                     "type": "function",
@@ -707,7 +746,14 @@ fn build_messages(
                 }));
             }
             "function_call_output" => {
-                flush_pending_tool_calls(&mut messages, &mut pending_tool_calls);
+                if settings.drop_tools {
+                    continue;
+                }
+                flush_pending_tool_calls(
+                    &mut messages,
+                    &mut pending_tool_calls,
+                    &mut pending_reasoning,
+                );
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": map["call_id"],
@@ -721,7 +767,11 @@ fn build_messages(
             }
         }
     }
-    flush_pending_tool_calls(&mut messages, &mut pending_tool_calls);
+    flush_pending_tool_calls(
+        &mut messages,
+        &mut pending_tool_calls,
+        &mut pending_reasoning,
+    );
 
     if messages.is_empty() {
         return Err(ProxyError::bad_request("input produced no chat messages"));
@@ -766,15 +816,24 @@ fn upstream_content_from_parts(parts: &[Value]) -> Value {
     )
 }
 
-fn flush_pending_tool_calls(messages: &mut Vec<Value>, pending_tool_calls: &mut Vec<Value>) {
+fn flush_pending_tool_calls(
+    messages: &mut Vec<Value>,
+    pending_tool_calls: &mut Vec<Value>,
+    pending_reasoning: &mut String,
+) {
     if pending_tool_calls.is_empty() {
+        pending_reasoning.clear();
         return;
     }
-    messages.push(json!({
+    let mut assistant_message = json!({
         "role": "assistant",
         "content": null,
         "tool_calls": Value::Array(std::mem::take(pending_tool_calls)),
-    }));
+    });
+    if !pending_reasoning.is_empty() {
+        assistant_message["reasoning_content"] = Value::String(std::mem::take(pending_reasoning));
+    }
+    messages.push(assistant_message);
 }
 
 fn normalize_tools(tools: Option<&Value>) -> Result<Vec<Value>, ProxyError> {
@@ -1134,6 +1193,8 @@ mod tests {
             request_timeout_seconds: 30.0,
             strict_protocol: false,
             upstream_supports_image_input: image_input,
+            drop_input_reasoning: false,
+            drop_tools: false,
             upstream_body: [("seed".to_owned(), json!(7))].into_iter().collect(),
             model_aliases: [("client-model".to_owned(), "aliased-model".to_owned())]
                 .into_iter()
@@ -1497,6 +1558,38 @@ mod tests {
         assert_eq!(translated.request_messages.len(), 1);
         assert_eq!(translated.request_messages[0]["role"], "user");
         assert_eq!(translated.request_messages[0]["content"], "hi");
+
+        let payload = json!({
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": {"q":"weather"}
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{"type":"summary_text","text":"plan"}]
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": {"ok": true}
+                }
+            ]
+        });
+        let object = payload.as_object().expect("object");
+        let report = analyze_protocol(object);
+        let translated =
+            translate_request(object, &settings(false), &report, &[]).expect("translate");
+        assert_eq!(translated.request_messages.len(), 2);
+        assert_eq!(translated.request_messages[0]["role"], "assistant");
+        assert_eq!(translated.request_messages[0]["reasoning_content"], "plan");
+        assert_eq!(
+            translated.request_messages[0]["tool_calls"][0]["id"],
+            "call_1"
+        );
+        assert_eq!(translated.request_messages[1]["role"], "tool");
     }
 
     #[test]
@@ -1615,10 +1708,28 @@ mod tests {
                 json!({"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}),
             ],
             None,
+            &settings(false),
         )
         .expect("messages");
         assert_eq!(messages[0]["role"], "assistant");
-        assert!(build_messages(&[], &[json!({"type":"custom"})], None).is_err());
+        assert!(build_messages(&[], &[json!({"type":"custom"})], None, &settings(false)).is_err());
+
+        let mut drop_tools_settings = settings(false);
+        drop_tools_settings.drop_tools = true;
+        let messages = build_messages(
+            &[],
+            &[
+                json!({"type":"reasoning","text":"thinking"}),
+                json!({"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}),
+                json!({"type":"function_call_output","call_id":"call_1","output":"{}"}),
+                json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}),
+            ],
+            None,
+            &drop_tools_settings,
+        )
+        .expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
 
         assert_eq!(
             upstream_content_from_parts(&[json!({"type":"other","text":"fallback"})])[0]["text"],
@@ -1626,8 +1737,15 @@ mod tests {
         );
         let mut messages = vec![];
         let mut pending = vec![];
-        flush_pending_tool_calls(&mut messages, &mut pending);
+        let mut pending_reasoning = String::new();
+        flush_pending_tool_calls(&mut messages, &mut pending, &mut pending_reasoning);
         assert!(messages.is_empty());
+
+        let mut messages = vec![];
+        let mut pending = vec![json!({"id":"call_1"})];
+        let mut pending_reasoning = "think".to_owned();
+        flush_pending_tool_calls(&mut messages, &mut pending, &mut pending_reasoning);
+        assert_eq!(messages[0]["reasoning_content"], "think");
 
         assert_eq!(normalize_tools(None).expect("none"), Vec::<Value>::new());
         assert!(convert_tool(&json!(1)).is_err());

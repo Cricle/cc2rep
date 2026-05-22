@@ -20,6 +20,11 @@ Codex 或其他客户端将 `base_url` 指向这个服务，并使用 `proxy_api
 
 `upstream_body` 可用于给上游请求追加自定义 JSON 字段，例如一些 provider 专有参数。代理自身生成的字段如 `model`、`messages`、`stream`、`tools` 仍然优先覆盖同名键。
 
+兼容开关：
+
+- `drop_input_reasoning`: 丢弃客户端输入里的 `reasoning` 项，避免继续把思考链历史传给上游。
+- `drop_tools`: 丢弃客户端声明的 `tools`、`tool_choice` 以及输入里的 `function_call` / `function_call_output`，强制退化为纯文本对话。
+
 当前版本支持：
 
 - `POST /v1/responses`

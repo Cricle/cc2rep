@@ -13,6 +13,8 @@
   "request_timeout_seconds": 120.0,
   "strict_protocol": false,
   "upstream_supports_image_input": false,
+  "drop_input_reasoning": false,
+  "drop_tools": false,
   "max_auto_tool_rounds": 8,
   "local_tools": {
     "echo_json": {
