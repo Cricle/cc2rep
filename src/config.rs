@@ -33,6 +33,12 @@ pub struct Settings {
     #[serde(default)]
     pub upstream_supports_image_input: bool,
     #[serde(default)]
+    pub upstream_supports_reasoning_content: bool,
+    #[serde(default)]
+    pub upstream_supports_tool_choice_required: bool,
+    #[serde(default)]
+    pub upstream_supports_named_tool_choice: bool,
+    #[serde(default)]
     pub drop_input_reasoning: bool,
     #[serde(default)]
     pub drop_tools: bool,
@@ -206,6 +212,9 @@ mod tests {
             request_timeout_seconds: 30.0,
             strict_protocol: false,
             upstream_supports_image_input: false,
+            upstream_supports_reasoning_content: false,
+            upstream_supports_tool_choice_required: false,
+            upstream_supports_named_tool_choice: false,
             drop_input_reasoning: false,
             drop_tools: false,
             upstream_body: [("seed".to_owned(), json!(1))].into_iter().collect(),

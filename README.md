@@ -20,10 +20,33 @@ Codex 或其他客户端将 `base_url` 指向这个服务，并使用 `proxy_api
 
 `upstream_body` 可用于给上游请求追加自定义 JSON 字段，例如一些 provider 专有参数。代理自身生成的字段如 `model`、`messages`、`stream`、`tools` 仍然优先覆盖同名键。
 
-兼容开关：
+稳定优先的通用能力开关：
 
+- `upstream_supports_image_input`: 上游支持 `image_url` / `input_image` 时再打开。
+- `upstream_supports_reasoning_content`: 上游要求工具续轮回传 `reasoning_content` 时打开，例如 DeepSeek thinking mode。
+- `upstream_supports_tool_choice_required`: 上游明确支持 `tool_choice: "required"` 时打开；默认会保守降级成 `auto`。
+- `upstream_supports_named_tool_choice`: 上游明确支持命名 `tool_choice` 对象时打开；默认会保守降级成 `auto`。
 - `drop_input_reasoning`: 丢弃客户端输入里的 `reasoning` 项，避免继续把思考链历史传给上游。
 - `drop_tools`: 丢弃客户端声明的 `tools`、`tool_choice` 以及输入里的 `function_call` / `function_call_output`，强制退化为纯文本对话。
+
+推荐策略：
+
+- 新接一个未知的 `chat/completions` provider 时，先保持所有 `upstream_supports_*` 为 `false`，优先确认基础文本对话稳定。
+- 确认 provider 支持对应能力后，再逐项打开 `image_input`、`reasoning_content`、命名 `tool_choice` 等高级特性。
+- DeepSeek 这类需要 thinking/tool roundtrip 的 provider，建议至少打开 `upstream_supports_reasoning_content`。
+
+DeepSeek 建议配置片段：
+
+```json
+{
+  "upstream_model": "deepseek-chat",
+  "upstream_supports_reasoning_content": true,
+  "upstream_supports_tool_choice_required": false,
+  "upstream_supports_named_tool_choice": false,
+  "drop_input_reasoning": false,
+  "drop_tools": false
+}
+```
 
 当前版本支持：
 
