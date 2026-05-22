@@ -520,6 +520,15 @@ fn normalize_input_item(item: &Value, settings: &Settings) -> Result<Value, Prox
                 .ok_or_else(|| ProxyError::bad_request("text item is missing text"))?;
             Ok(normalized_message("user", vec![normalized_text_part(text)]))
         }
+        Some("reasoning") => Ok(json!({
+            "type": "reasoning",
+            "summary": map.get("summary").cloned().unwrap_or(Value::Null),
+            "text": map
+                .get("summary")
+                .and_then(flatten_reasoning_value)
+                .or_else(|| extract_first_reasoning(map))
+                .unwrap_or_default(),
+        })),
         Some("function_call") => {
             let name = map
                 .get("name")
@@ -686,6 +695,7 @@ fn build_messages(
                     "content": upstream_content_from_parts(content),
                 }));
             }
+            "reasoning" => {}
             "function_call" => {
                 pending_tool_calls.push(json!({
                     "id": map["call_id"],
@@ -1461,6 +1471,35 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_ignores_reasoning_input_items() {
+        let payload = json!({
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [
+                        {"type":"summary_text","text":"thinking"},
+                        " done"
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "hi"
+                }
+            ]
+        });
+        let object = payload.as_object().expect("object");
+        let report = analyze_protocol(object);
+        let translated =
+            translate_request(object, &settings(false), &report, &[]).expect("translate");
+        assert_eq!(translated.input_items[0]["type"], "reasoning");
+        assert_eq!(translated.input_items[0]["text"], "thinking done");
+        assert_eq!(translated.request_messages.len(), 1);
+        assert_eq!(translated.request_messages[0]["role"], "user");
+        assert_eq!(translated.request_messages[0]["content"], "hi");
+    }
+
+    #[test]
     fn parse_assistant_turn_reports_invalid_upstream_shapes() {
         assert!(parse_assistant_turn_from_response(&json!({})).is_err());
         assert!(parse_assistant_turn_from_response(&json!({"choices":[{}]})).is_err());
@@ -1535,6 +1574,14 @@ mod tests {
         );
         assert_eq!(
             normalize_input_item(
+                &json!({"type":"reasoning","summary":[{"text":"step "},"done"]}),
+                &settings(false)
+            )
+            .expect("reasoning item")["text"],
+            "step done"
+        );
+        assert_eq!(
+            normalize_input_item(
                 &json!({"type":"image_url","url":"https://img"}),
                 &settings(true)
             )
@@ -1563,7 +1610,10 @@ mod tests {
 
         let messages = build_messages(
             &[],
-            &[json!({"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"})],
+            &[
+                json!({"type":"reasoning","text":"thinking"}),
+                json!({"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}),
+            ],
             None,
         )
         .expect("messages");
