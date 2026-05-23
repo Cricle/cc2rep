@@ -721,7 +721,7 @@ fn build_messages(
                 }));
             }
             "reasoning" => {
-                if settings.drop_input_reasoning || pending_tool_calls.is_empty() {
+                if settings.drop_input_reasoning {
                     continue;
                 }
                 let reasoning = map
@@ -1586,14 +1586,14 @@ mod tests {
         let payload = json!({
             "input": [
                 {
+                    "type": "reasoning",
+                    "summary": [{"type":"summary_text","text":"plan first"}]
+                },
+                {
                     "type": "function_call",
                     "call_id": "call_1",
                     "name": "lookup",
                     "arguments": {"q":"weather"}
-                },
-                {
-                    "type": "reasoning",
-                    "summary": [{"type":"summary_text","text":"plan"}]
                 },
                 {
                     "type": "function_call_output",
@@ -1609,7 +1609,10 @@ mod tests {
         let translated = translate_request(object, &cfg, &report, &[]).expect("translate");
         assert_eq!(translated.request_messages.len(), 2);
         assert_eq!(translated.request_messages[0]["role"], "assistant");
-        assert_eq!(translated.request_messages[0]["reasoning_content"], "plan");
+        assert_eq!(
+            translated.request_messages[0]["reasoning_content"],
+            "plan first"
+        );
         assert_eq!(
             translated.request_messages[0]["tool_calls"][0]["id"],
             "call_1"
