@@ -58,6 +58,8 @@ fn mimo_settings() -> Settings {
         model_aliases: Default::default(),
         local_tools: Default::default(),
         max_auto_tool_rounds: 8,
+        upstream_max_retries: 3,
+        upstream_retry_base_delay_ms: 1000,
     }
 }
 
@@ -93,7 +95,7 @@ fn calculator_tool() -> Value {
 
 /// Shared router: probe once, reuse for all tests.
 static SHARED_ROUTER: LazyLock<tokio::sync::OnceCell<Router>> =
-    LazyLock::new(|| tokio::sync::OnceCell::new());
+    LazyLock::new(tokio::sync::OnceCell::new);
 
 async fn shared_router() -> &'static Router {
     SHARED_ROUTER
@@ -818,7 +820,7 @@ async fn response_list_input_items() {
             .to_bytes(),
     )
     .expect("json");
-    assert!(items["data"].as_array().unwrap().len() > 0);
+    assert!(!items["data"].as_array().unwrap().is_empty());
 }
 
 // ============================================================

@@ -17,6 +17,8 @@
   "drop_tools": false,
   "response_ttl_seconds": 3600,
   "max_auto_tool_rounds": 8,
+  "upstream_max_retries": 3,
+  "upstream_retry_base_delay_ms": 1000,
   "local_tools": {
     "echo_json": {
       "command": "sh",

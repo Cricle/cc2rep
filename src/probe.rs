@@ -206,9 +206,9 @@ pub async fn probe_upstream(settings: &Settings) -> Capabilities {
 }
 
 fn check_reasoning_support(body: &str, caps: &mut Capabilities) {
-    if let Ok(value) = serde_json::from_str::<Value>(body) {
-        if let Some(choices) = value.get("choices").and_then(Value::as_array) {
-            if let Some(message) = choices
+    if let Ok(value) = serde_json::from_str::<Value>(body)
+        && let Some(choices) = value.get("choices").and_then(Value::as_array)
+            && let Some(message) = choices
                 .first()
                 .and_then(|c| c.get("message"))
                 .and_then(Value::as_object)
@@ -229,6 +229,4 @@ fn check_reasoning_support(body: &str, caps: &mut Capabilities) {
                     }
                 }
             }
-        }
-    }
 }

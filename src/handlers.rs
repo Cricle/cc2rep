@@ -34,11 +34,10 @@ pub(crate) async fn create_response(
     };
 
     let report = analyze_protocol(map);
-    if state.settings.strict_protocol {
-        if let Some(message) = report.strict_error() {
+    if state.settings.strict_protocol
+        && let Some(message) = report.strict_error() {
             return Err(ProxyError::bad_request(message));
         }
-    }
     let previous_messages = crate::app::load_previous_messages(&state.store, map).await?;
     let translated = translate_request(
         map,
@@ -219,8 +218,11 @@ pub(crate) async fn cancel_response(
         },
         stored.request_messages.clone(),
     );
-    let _ = crate::app::store_final_response(&state.store, &translated, cancelled_response.clone())
-        .await;
+    if let Err(err) = crate::app::store_final_response(&state.store, &translated, cancelled_response.clone())
+        .await
+    {
+        warn!(response_id = %response_id, "failed to store cancelled response: {err}");
+    }
     info!(response_id = %response_id, "response cancelled");
     Ok((StatusCode::OK, Json(cancelled_response)).into_response())
 }

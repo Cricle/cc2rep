@@ -311,7 +311,9 @@ pub(crate) fn stream_response(
                 state.usage.clone(),
                 unix_timestamp(),
             );
-            let _ = store_final_response(&store, &translated_for_store, cancelled_response.clone()).await;
+            if let Err(err) = store_final_response(&store, &translated_for_store, cancelled_response.clone()).await {
+                warn!(response_id = %response_id, "failed to store cancelled response: {err}");
+            }
             let _ = inflight.finish(&response_id).await;
             yield Ok::<Event, Infallible>(json_event("response.completed", &mut sequence_number, json!({
                 "type": "response.completed",
@@ -329,7 +331,9 @@ pub(crate) fn stream_response(
                 &message,
                 "upstream_stream_error",
             );
-            let _ = store_final_response(&store, &translated_for_store, failed.clone()).await;
+            if let Err(err) = store_final_response(&store, &translated_for_store, failed.clone()).await {
+                warn!(response_id = %response_id, "failed to store failed response: {err}");
+            }
             let _ = inflight.finish(&response_id).await;
             yield Ok::<Event, Infallible>(json_event("response.failed", &mut sequence_number, json!({
                 "type": "response.failed",
@@ -348,7 +352,9 @@ pub(crate) fn stream_response(
             state.usage.clone(),
             unix_timestamp(),
         );
-        let _ = store_final_response(&store, &translated_for_store, final_response.clone()).await;
+        if let Err(err) = store_final_response(&store, &translated_for_store, final_response.clone()).await {
+            warn!(response_id = %response_id, "failed to store final response: {err}");
+        }
         let _ = inflight.finish(&response_id).await;
         info!(
             response_id = %response_id,
@@ -365,6 +371,7 @@ pub(crate) fn stream_response(
         .into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_response_with_auto_tools(
     upstream: UpstreamClient,
     tool_executor: ToolExecutor,
@@ -486,7 +493,9 @@ pub(crate) fn stream_response_with_auto_tools(
                 unix_timestamp(),
             );
             let translated = translated_with_request_messages(&translated, extract_request_messages(&current_payload));
-            let _ = store_final_response(&store, &translated, cancelled_response.clone()).await;
+            if let Err(err) = store_final_response(&store, &translated, cancelled_response.clone()).await {
+                warn!(response_id = %response_id, "failed to store cancelled response: {err}");
+            }
             let _ = inflight.finish(&response_id).await;
             yield Ok::<Event, Infallible>(json_event("response.completed", &mut sequence_number, json!({
                 "type": "response.completed",
@@ -504,7 +513,9 @@ pub(crate) fn stream_response_with_auto_tools(
                 "upstream_stream_error",
             );
             let translated = translated_with_request_messages(&translated, extract_request_messages(&current_payload));
-            let _ = store_final_response(&store, &translated, failed.clone()).await;
+            if let Err(err) = store_final_response(&store, &translated, failed.clone()).await {
+                warn!(response_id = %response_id, "failed to store failed response: {err}");
+            }
             let _ = inflight.finish(&response_id).await;
             yield Ok::<Event, Infallible>(json_event("response.failed", &mut sequence_number, json!({
                 "type": "response.failed",
@@ -524,7 +535,9 @@ pub(crate) fn stream_response_with_auto_tools(
             unix_timestamp(),
         );
         let translated = translated_with_request_messages(&translated, extract_request_messages(&current_payload));
-        let _ = store_final_response(&store, &translated, final_response.clone()).await;
+        if let Err(err) = store_final_response(&store, &translated, final_response.clone()).await {
+            warn!(response_id = %response_id, "failed to store final response: {err}");
+        }
         let _ = inflight.finish(&response_id).await;
         yield Ok::<Event, Infallible>(json_event("response.completed", &mut sequence_number, json!({
             "type": "response.completed",
@@ -750,6 +763,8 @@ mod tests {
                 .collect(),
             local_tools: Default::default(),
             max_auto_tool_rounds: 8,
+            upstream_max_retries: 0,
+            upstream_retry_base_delay_ms: 0,
         }
     }
 

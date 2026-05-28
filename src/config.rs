@@ -52,6 +52,10 @@ pub struct Settings {
     pub local_tools: HashMap<String, LocalToolSettings>,
     #[serde(default = "default_max_auto_tool_rounds")]
     pub max_auto_tool_rounds: u32,
+    #[serde(default = "default_upstream_max_retries")]
+    pub upstream_max_retries: u32,
+    #[serde(default = "default_upstream_retry_base_delay_ms")]
+    pub upstream_retry_base_delay_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +97,14 @@ fn default_tool_timeout_seconds() -> f64 {
 
 fn default_max_auto_tool_rounds() -> u32 {
     8
+}
+
+fn default_upstream_max_retries() -> u32 {
+    3
+}
+
+fn default_upstream_retry_base_delay_ms() -> u64 {
+    1000
 }
 
 fn default_response_ttl_seconds() -> u64 {
@@ -230,6 +242,8 @@ mod tests {
                 .collect(),
             local_tools: HashMap::new(),
             max_auto_tool_rounds: 8,
+            upstream_max_retries: 3,
+            upstream_retry_base_delay_ms: 1000,
         }
     }
 

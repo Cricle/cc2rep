@@ -14,6 +14,8 @@ pub struct UpstreamClient {
     upstream_url: String,
     headers: HeaderMap,
     http: Client,
+    max_retries: u32,
+    retry_base_delay: Duration,
 }
 
 impl UpstreamClient {
@@ -30,6 +32,8 @@ impl UpstreamClient {
             upstream_url,
             headers,
             http,
+            max_retries: settings.upstream_max_retries,
+            retry_base_delay: Duration::from_millis(settings.upstream_retry_base_delay_ms),
         })
     }
 
@@ -65,33 +69,67 @@ impl UpstreamClient {
 
     async fn send(&self, payload: &Value) -> Result<Response, ProxyError> {
         let model = payload.get("model").and_then(Value::as_str).unwrap_or("");
-        info!(
-            upstream_url = %self.upstream_url,
-            model = %model,
-            "sending request to upstream"
-        );
-        let request = self
-            .http
-            .post(&self.upstream_url)
-            .headers(self.headers.clone())
-            .json(payload);
+        let mut last_err = None;
 
-        let response = request.send().await.map_err(map_reqwest_error)?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "failed to read upstream error body".to_owned());
-            warn!(
-                upstream_status = %status,
-                upstream_error_body = %body,
-                "upstream request failed"
+        for attempt in 0..=self.max_retries {
+            if attempt > 0 {
+                let delay = self.retry_base_delay * 2u32.pow(attempt - 1);
+                warn!(
+                    attempt = attempt,
+                    max_retries = self.max_retries,
+                    delay_ms = delay.as_millis() as u64,
+                    "retrying upstream request after 429"
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            info!(
+                upstream_url = %self.upstream_url,
+                model = %model,
+                attempt = attempt,
+                "sending request to upstream"
             );
-            return Err(ProxyError::from_upstream_body(status, body));
+            let request = self
+                .http
+                .post(&self.upstream_url)
+                .headers(self.headers.clone())
+                .json(payload);
+
+            let response = request.send().await.map_err(map_reqwest_error)?;
+            let status = response.status();
+
+            if status.as_u16() == 429 && attempt < self.max_retries {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "rate limited".to_owned());
+                warn!(
+                    upstream_status = %status,
+                    attempt = attempt,
+                    "upstream rate limited, will retry"
+                );
+                last_err = Some(ProxyError::from_upstream_body(status, body));
+                continue;
+            }
+
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "failed to read upstream error body".to_owned());
+                warn!(
+                    upstream_status = %status,
+                    upstream_error_body = %body,
+                    "upstream request failed"
+                );
+                return Err(ProxyError::from_upstream_body(status, body));
+            }
+
+            info!(upstream_status = %status, "upstream request succeeded");
+            return Ok(response);
         }
-        info!(upstream_status = %status, "upstream request succeeded");
-        Ok(response)
+
+        Err(last_err.unwrap_or_else(|| ProxyError::Transport("max retries exceeded".to_owned())))
     }
 }
 
@@ -171,6 +209,8 @@ mod tests {
             model_aliases: Default::default(),
             local_tools: Default::default(),
             max_auto_tool_rounds: 8,
+            upstream_max_retries: 3,
+            upstream_retry_base_delay_ms: 100,
         }
     }
 

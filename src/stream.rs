@@ -128,7 +128,7 @@ pub(crate) fn json_event(
     Event::default()
         .event(name)
         .json_data(payload)
-        .expect("valid SSE event")
+        .unwrap_or_else(|_| Event::default().event(name).data("{}"))
 }
 
 pub(crate) fn finalize_stream_items(
@@ -239,8 +239,8 @@ pub(crate) fn apply_stream_delta(
         return Ok(events);
     };
 
-    if let Some(reasoning_delta) = extract_first_reasoning(delta) {
-        if !reasoning_delta.is_empty() {
+    if let Some(reasoning_delta) = extract_first_reasoning(delta)
+        && !reasoning_delta.is_empty() {
             if !state.reasoning_started {
                 state.reasoning_started = true;
                 events.push(json_event(
@@ -265,7 +265,6 @@ pub(crate) fn apply_stream_delta(
                 }),
             ));
         }
-    }
 
     if let Some(content) = delta.get("content") {
         let delta_text = match content {
@@ -377,8 +376,7 @@ pub(crate) fn apply_stream_delta(
                     .get("function")
                     .and_then(|f| f.get("arguments"))
                     .and_then(Value::as_str)
-                {
-                    if !args.is_empty() {
+                    && !args.is_empty() {
                         events.push(json_event(
                             "response.function_call_arguments.delta",
                             sequence_number,
@@ -390,7 +388,6 @@ pub(crate) fn apply_stream_delta(
                             }),
                         ));
                     }
-                }
             }
         }
     }

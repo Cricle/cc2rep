@@ -386,13 +386,11 @@ pub fn extract_first_reasoning(map: &Map<String, Value>) -> Option<String> {
         "thinking",
         "reasoning_summary",
     ] {
-        if let Some(value) = map.get(key) {
-            if let Some(reasoning) = flatten_reasoning_value(value) {
-                if !reasoning.is_empty() {
+        if let Some(value) = map.get(key)
+            && let Some(reasoning) = flatten_reasoning_value(value)
+                && !reasoning.is_empty() {
                     return Some(reasoning);
                 }
-            }
-        }
     }
     None
 }
@@ -421,11 +419,10 @@ pub fn flatten_reasoning_value(value: &Value) -> Option<String> {
         }
         Value::Object(map) => {
             for key in ["text", "content", "summary", "reasoning_content"] {
-                if let Some(value) = map.get(key) {
-                    if let Some(text) = flatten_reasoning_value(value) {
+                if let Some(value) = map.get(key)
+                    && let Some(text) = flatten_reasoning_value(value) {
                         return Some(text);
                     }
-                }
             }
             None
         }
