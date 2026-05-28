@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 mod handlers;
 mod hosted;
+pub mod metrics;
 mod normalize;
 pub mod probe;
 pub mod protocol;

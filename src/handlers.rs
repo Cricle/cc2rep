@@ -15,6 +15,12 @@ pub(crate) async fn healthz() -> Response {
     Json(json!({ "ok": true })).into_response()
 }
 
+pub(crate) async fn stats(State(state): State<AppState>) -> Response {
+    let inflight = state.inflight.count().await;
+    let stored = state.store.count().await;
+    Json(state.metrics.snapshot(inflight, stored)).into_response()
+}
+
 pub(crate) async fn create_response(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -68,6 +74,8 @@ pub(crate) async fn create_response(
     }
     translated.context.hosted_output_items = hosted_ctx.output_items;
 
+    state.metrics.record_request(translated.context.stream);
+
     if translated.context.store {
         state
             .store
@@ -100,6 +108,7 @@ pub(crate) async fn create_response(
                     state.settings.clone(),
                     state.store.clone(),
                     state.inflight.clone(),
+                    state.metrics.clone(),
                     cancel_flag,
                     response,
                     translated,
@@ -108,6 +117,7 @@ pub(crate) async fn create_response(
                 crate::app::stream_response(
                     state.store.clone(),
                     state.inflight.clone(),
+                    state.metrics.clone(),
                     cancel_flag,
                     response,
                     translated,
@@ -122,6 +132,9 @@ pub(crate) async fn create_response(
             execution.usage,
             crate::translate::unix_timestamp(),
         );
+        state
+            .metrics
+            .record_completion(payload.get("usage").unwrap_or(&json!({})));
         let translated =
             crate::app::translated_with_request_messages(&translated, execution.request_messages);
         crate::app::store_final_response(&state.store, &translated, payload.clone()).await?;

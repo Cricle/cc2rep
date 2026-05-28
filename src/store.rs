@@ -54,6 +54,10 @@ impl ResponseStore {
         Ok(self.inner.write().await.remove(response_id))
     }
 
+    pub async fn count(&self) -> usize {
+        self.inner.read().await.len()
+    }
+
     pub fn start_cleanup_task(&self) {
         let store = self.clone();
         let ttl = *self.ttl_seconds;

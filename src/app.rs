@@ -24,6 +24,7 @@ use tracing::{info, warn};
 use crate::{
     config::Settings,
     error::ProxyError,
+    metrics::RequestMetrics,
     probe::Capabilities,
     store::{ResponseStore, StoredResponse},
     stream::{
@@ -48,6 +49,7 @@ pub(crate) struct AppState {
     pub tool_executor: ToolExecutor,
     pub store: ResponseStore,
     pub inflight: InflightRegistry,
+    pub metrics: Arc<RequestMetrics>,
 }
 
 #[derive(Clone, Default)]
@@ -81,6 +83,10 @@ impl InflightRegistry {
     pub(crate) async fn finish(&self, response_id: &str) {
         self.inner.write().await.remove(response_id);
     }
+
+    pub(crate) async fn count(&self) -> usize {
+        self.inner.read().await.len()
+    }
 }
 
 pub fn build_router(settings: Settings, capabilities: Capabilities) -> Router {
@@ -97,10 +103,12 @@ pub fn build_router(settings: Settings, capabilities: Capabilities) -> Router {
         upstream,
         http_client,
         inflight: InflightRegistry::default(),
+        metrics: Arc::new(RequestMetrics::default()),
     };
 
     Router::new()
         .route("/healthz", get(crate::handlers::healthz))
+        .route("/stats", get(crate::handlers::stats))
         .route("/v1/responses", post(crate::handlers::create_response))
         .route(
             "/v1/responses/{response_id}",
@@ -237,6 +245,7 @@ pub(crate) fn translated_with_request_messages(
 pub(crate) fn stream_response(
     store: ResponseStore,
     inflight: InflightRegistry,
+    metrics: Arc<RequestMetrics>,
     cancel_flag: Arc<AtomicBool>,
     response: reqwest::Response,
     translated: crate::translate::TranslatedRequest,
@@ -322,6 +331,7 @@ pub(crate) fn stream_response(
         let assistant_turn = state.take_turn();
 
         if cancelled {
+            metrics.record_cancellation();
             let cancelled_response = build_cancelled_response(
                 &context,
                 &assistant_turn,
@@ -340,6 +350,7 @@ pub(crate) fn stream_response(
         }
 
         if let Some(message) = failed_message {
+            metrics.record_failure();
             warn!("stream failed: {message}");
             let failed = build_failed_response(
                 &context,
@@ -369,6 +380,7 @@ pub(crate) fn stream_response(
             state.usage.clone(),
             unix_timestamp(),
         );
+        metrics.record_completion(final_response.get("usage").unwrap_or(&json!({})));
         if let Err(err) = store_final_response(&store, &translated_for_store, final_response.clone()).await {
             warn!(response_id = %response_id, "failed to store final response: {err}");
         }
@@ -395,6 +407,7 @@ pub(crate) fn stream_response_with_auto_tools(
     settings: Arc<Settings>,
     store: ResponseStore,
     inflight: InflightRegistry,
+    metrics: Arc<RequestMetrics>,
     cancel_flag: Arc<AtomicBool>,
     response: reqwest::Response,
     translated: crate::translate::TranslatedRequest,
@@ -516,6 +529,7 @@ pub(crate) fn stream_response_with_auto_tools(
         }
 
         if cancelled {
+            metrics.record_cancellation();
             let cancelled_response = build_cancelled_response(
                 &context,
                 &final_turn,
@@ -535,6 +549,7 @@ pub(crate) fn stream_response_with_auto_tools(
         }
 
         if let Some(message) = failed_message {
+            metrics.record_failure();
             let failed = build_failed_response(
                 &context,
                 &final_turn,
@@ -564,6 +579,7 @@ pub(crate) fn stream_response_with_auto_tools(
             final_usage,
             unix_timestamp(),
         );
+        metrics.record_completion(final_response.get("usage").unwrap_or(&json!({})));
         let translated = translated_with_request_messages(&translated, extract_request_messages(&current_payload));
         if let Err(err) = store_final_response(&store, &translated, final_response.clone()).await {
             warn!(response_id = %response_id, "failed to store final response: {err}");
@@ -1921,6 +1937,7 @@ mod tests {
             ))),
             store: ResponseStore::default(),
             inflight: InflightRegistry::default(),
+            metrics: Arc::new(RequestMetrics::default()),
         };
         app_state
             .store
