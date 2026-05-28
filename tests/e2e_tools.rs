@@ -2,9 +2,7 @@ mod common;
 
 use serde_json::{Value, json};
 
-use common::{
-    MIMO_MODEL, calculator_tool, send_json, send_stream, shared_router, weather_tool,
-};
+use common::{MIMO_MODEL, calculator_tool, send_json, send_stream, shared_router, weather_tool};
 
 #[tokio::test]
 async fn non_stream_tool_choice_auto() {

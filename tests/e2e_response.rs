@@ -1,10 +1,10 @@
 mod common;
 
 use axum::{body::Body, http::Request};
+use common::{MIMO_MODEL, PROXY_KEY, send, send_json, send_json_expect_error, shared_router};
 use http::StatusCode;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use common::{MIMO_MODEL, PROXY_KEY, send, send_json, send_json_expect_error, shared_router};
 
 #[tokio::test]
 async fn response_get_and_delete() {

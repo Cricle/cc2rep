@@ -1,10 +1,10 @@
 mod common;
 
 use axum::{body::Body, http::Request};
+use common::{PROXY_KEY, send, shared_router};
 use http::StatusCode;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use common::{PROXY_KEY, send, shared_router};
 
 #[tokio::test]
 async fn stats_endpoint_returns_json() {

@@ -508,3 +508,88 @@ pub fn unix_timestamp() -> i64 {
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_from_upstream_with_cached_tokens() {
+        let upstream = json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "total_tokens": 1200,
+            "prompt_tokens_details": {
+                "cached_tokens": 800
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": 50
+            }
+        });
+        let usage = usage_from_upstream(Some(&upstream));
+        assert_eq!(usage["input_tokens"], 1000);
+        assert_eq!(usage["output_tokens"], 200);
+        assert_eq!(usage["total_tokens"], 1200);
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 800);
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 50);
+    }
+
+    #[test]
+    fn usage_from_upstream_with_zero_cached_tokens() {
+        let upstream = json!({
+            "prompt_tokens": 500,
+            "completion_tokens": 100,
+            "prompt_tokens_details": { "cached_tokens": 0 }
+        });
+        let usage = usage_from_upstream(Some(&upstream));
+        assert_eq!(usage["input_tokens"], 500);
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 0);
+    }
+
+    #[test]
+    fn usage_from_upstream_without_prompt_tokens_details() {
+        let upstream = json!({
+            "prompt_tokens": 300,
+            "completion_tokens": 50,
+            "total_tokens": 350
+        });
+        let usage = usage_from_upstream(Some(&upstream));
+        assert_eq!(usage["input_tokens"], 300);
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 0);
+    }
+
+    #[test]
+    fn usage_from_upstream_none_returns_empty() {
+        let usage = usage_from_upstream(None);
+        assert_eq!(usage["input_tokens"], 0);
+        assert_eq!(usage["output_tokens"], 0);
+        assert_eq!(usage["total_tokens"], 0);
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 0);
+    }
+
+    #[test]
+    fn usage_from_upstream_fully_cached() {
+        let upstream = json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "total_tokens": 1200,
+            "prompt_tokens_details": {
+                "cached_tokens": 1000
+            }
+        });
+        let usage = usage_from_upstream(Some(&upstream));
+        assert_eq!(usage["input_tokens"], 1000);
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 1000);
+    }
+
+    #[test]
+    fn usage_from_upstream_total_auto_calculated() {
+        let upstream = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 50
+        });
+        let usage = usage_from_upstream(Some(&upstream));
+        assert_eq!(usage["total_tokens"], 150);
+    }
+}

@@ -1,10 +1,10 @@
 mod common;
 
 use axum::{body::Body, http::Request};
+use common::{send, shared_router};
 use http::StatusCode;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use common::{send, shared_router};
 
 #[tokio::test]
 async fn healthz_returns_ok() {
