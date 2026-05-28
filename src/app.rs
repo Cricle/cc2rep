@@ -183,7 +183,10 @@ pub(crate) async fn execute_non_stream_turn(
         }
 
         last_upstream = state.upstream.chat_json(&upstream_payload).await?;
-        merge_usage(&mut total_usage, &usage_from_upstream(last_upstream.get("usage")));
+        merge_usage(
+            &mut total_usage,
+            &usage_from_upstream(last_upstream.get("usage")),
+        );
         let next_turn = parse_assistant_turn_from_response(&last_upstream)?;
         if next_turn.tool_calls.is_empty() {
             return Ok(NonStreamExecution {
