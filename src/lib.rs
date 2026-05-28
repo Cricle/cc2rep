@@ -1,9 +1,13 @@
 pub mod app;
 pub mod config;
 pub mod error;
+mod handlers;
+mod normalize;
 pub mod probe;
 pub mod protocol;
+mod response;
 pub mod store;
+mod stream;
 pub mod tools;
 pub mod translate;
 pub mod upstream;

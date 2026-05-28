@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     convert::Infallible,
     sync::{
         Arc,
@@ -9,9 +9,7 @@ use std::{
 
 use async_stream::stream;
 use axum::{
-    Json, Router,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    Router,
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -27,50 +25,50 @@ use crate::{
     config::Settings,
     error::ProxyError,
     probe::Capabilities,
-    protocol::analyze_protocol,
     store::{ResponseStore, StoredResponse},
+    stream::{SseParser, StreamRoundOutcome, StreamState, apply_stream_delta, collect_stream_turn,
+             finalize_stream_items, json_event},
     tools::{ToolExecutor, append_tool_outputs},
     translate::{
-        AssistantTurn, RequestContext, ToolCall, build_cancelled_response, build_content_part,
-        build_failed_response, build_function_call_item, build_history_message,
-        build_in_progress_response, build_message_item, build_reasoning_item, build_response,
-        extract_first_reasoning, function_item_id, message_output_offset,
-        parse_assistant_turn_from_response, reasoning_output_offset, translate_request,
+        AssistantTurn, RequestContext, ToolCall, build_cancelled_response,
+        build_failed_response, build_history_message,
+        build_in_progress_response, build_response,
+        parse_assistant_turn_from_response,
         unix_timestamp, usage_from_upstream,
     },
     upstream::UpstreamClient,
 };
 
 #[derive(Clone)]
-struct AppState {
-    settings: Arc<Settings>,
-    capabilities: Capabilities,
-    upstream: UpstreamClient,
-    tool_executor: ToolExecutor,
-    store: ResponseStore,
-    inflight: InflightRegistry,
+pub(crate) struct AppState {
+    pub settings: Arc<Settings>,
+    pub capabilities: Capabilities,
+    pub upstream: UpstreamClient,
+    pub tool_executor: ToolExecutor,
+    pub store: ResponseStore,
+    pub inflight: InflightRegistry,
 }
 
 #[derive(Clone, Default)]
-struct InflightRegistry {
+pub(crate) struct InflightRegistry {
     inner: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 #[derive(Clone)]
-struct NonStreamExecution {
-    turn: AssistantTurn,
-    usage: Value,
-    request_messages: Vec<Value>,
+pub(crate) struct NonStreamExecution {
+    pub turn: AssistantTurn,
+    pub usage: Value,
+    pub request_messages: Vec<Value>,
 }
 
 impl InflightRegistry {
-    async fn start(&self, response_id: String) -> Arc<AtomicBool> {
+    pub(crate) async fn start(&self, response_id: String) -> Arc<AtomicBool> {
         let token = Arc::new(AtomicBool::new(false));
         self.inner.write().await.insert(response_id, token.clone());
         token
     }
 
-    async fn cancel(&self, response_id: &str) -> bool {
+    pub(crate) async fn cancel(&self, response_id: &str) -> bool {
         let guard = self.inner.read().await;
         let Some(flag) = guard.get(response_id) else {
             return false;
@@ -79,7 +77,7 @@ impl InflightRegistry {
         true
     }
 
-    async fn finish(&self, response_id: &str) {
+    pub(crate) async fn finish(&self, response_id: &str) {
         self.inner.write().await.remove(response_id);
     }
 }
@@ -99,121 +97,22 @@ pub fn build_router(settings: Settings, capabilities: Capabilities) -> Router {
     };
 
     Router::new()
-        .route("/healthz", get(healthz))
-        .route("/v1/responses", post(create_response))
+        .route("/healthz", get(crate::handlers::healthz))
+        .route("/v1/responses", post(crate::handlers::create_response))
         .route(
             "/v1/responses/{response_id}",
-            get(get_response).delete(delete_response),
+            get(crate::handlers::get_response).delete(crate::handlers::delete_response),
         )
         .route(
             "/v1/responses/{response_id}/input_items",
-            get(list_input_items),
+            get(crate::handlers::list_input_items),
         )
-        .route("/v1/responses/{response_id}/cancel", post(cancel_response))
+        .route("/v1/responses/{response_id}/cancel", post(crate::handlers::cancel_response))
         .with_state(state)
 }
 
-async fn healthz() -> impl IntoResponse {
-    Json(json!({ "ok": true }))
-}
 
-async fn create_response(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Result<Response, ProxyError> {
-    authorize(&state.settings, &headers)?;
-
-    let object = payload
-        .as_object()
-        .ok_or_else(|| ProxyError::bad_request("request body must be a JSON object"))?;
-    let report = analyze_protocol(object);
-    if state.settings.strict_protocol {
-        if let Some(message) = report.strict_error() {
-            return Err(ProxyError::bad_request(message));
-        }
-    }
-
-    let previous_messages = load_previous_messages(&state.store, object).await?;
-    let translated = translate_request(
-        object,
-        &state.settings,
-        &report,
-        &previous_messages,
-        &state.capabilities,
-    )?;
-    info!(
-        response_id = %translated.context.response_id,
-        model = %translated.context.upstream_model,
-        stream = translated.context.stream,
-        "request accepted"
-    );
-
-    if translated.context.store {
-        state
-            .store
-            .put(
-                translated.context.response_id.clone(),
-                StoredResponse {
-                    response: build_in_progress_response(&translated.context),
-                    input_items: translated.input_items.clone(),
-                    request_messages: translated.request_messages.clone(),
-                    inserted_at: std::time::Instant::now(),
-                },
-            )
-            .await?;
-    }
-
-    if translated.context.stream {
-        let cancel_flag = state
-            .inflight
-            .start(translated.context.response_id.clone())
-            .await;
-        let response = state
-            .upstream
-            .chat_stream(&translated.upstream_payload)
-            .await?;
-        Ok(
-            if should_auto_execute_tools(&state.tool_executor, &translated) {
-                stream_response_with_auto_tools(
-                    state.upstream.clone(),
-                    state.tool_executor.clone(),
-                    state.settings.clone(),
-                    state.store.clone(),
-                    state.inflight.clone(),
-                    cancel_flag,
-                    response,
-                    translated,
-                )
-            } else {
-                stream_response(
-                    state.store.clone(),
-                    state.inflight.clone(),
-                    cancel_flag,
-                    response,
-                    translated,
-                )
-            },
-        )
-    } else {
-        let execution = execute_non_stream_turn(&state, &translated).await?;
-        let payload = build_response(
-            &translated.context,
-            &execution.turn,
-            execution.usage,
-            unix_timestamp(),
-        );
-        let translated = translated_with_request_messages(&translated, execution.request_messages);
-        store_final_response(&state.store, &translated, payload.clone()).await?;
-        info!(
-            response_id = %translated.context.response_id,
-            "non-stream request completed"
-        );
-        Ok((StatusCode::OK, Json(payload)).into_response())
-    }
-}
-
-async fn execute_non_stream_turn(
+pub(crate) async fn execute_non_stream_turn(
     state: &AppState,
     translated: &crate::translate::TranslatedRequest,
 ) -> Result<NonStreamExecution, ProxyError> {
@@ -296,7 +195,7 @@ async fn execute_non_stream_turn(
     })
 }
 
-fn should_auto_execute_tools(
+pub(crate) fn should_auto_execute_tools(
     tool_executor: &ToolExecutor,
     translated: &crate::translate::TranslatedRequest,
 ) -> bool {
@@ -313,7 +212,7 @@ fn should_auto_execute_tools(
         })
 }
 
-fn extract_request_messages(payload: &Value) -> Vec<Value> {
+pub(crate) fn extract_request_messages(payload: &Value) -> Vec<Value> {
     payload
         .get("messages")
         .and_then(Value::as_array)
@@ -321,7 +220,7 @@ fn extract_request_messages(payload: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn translated_with_request_messages(
+pub(crate) fn translated_with_request_messages(
     translated: &crate::translate::TranslatedRequest,
     request_messages: Vec<Value>,
 ) -> crate::translate::TranslatedRequest {
@@ -330,102 +229,8 @@ fn translated_with_request_messages(
     translated
 }
 
-async fn get_response(
-    State(state): State<AppState>,
-    Path(response_id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Response, ProxyError> {
-    authorize(&state.settings, &headers)?;
-    let stored =
-        state.store.get(&response_id).await?.ok_or_else(|| {
-            ProxyError::bad_request(format!("response `{response_id}` not found"))
-        })?;
-    Ok((StatusCode::OK, Json(stored.response)).into_response())
-}
 
-async fn list_input_items(
-    State(state): State<AppState>,
-    Path(response_id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Response, ProxyError> {
-    authorize(&state.settings, &headers)?;
-    let stored =
-        state.store.get(&response_id).await?.ok_or_else(|| {
-            ProxyError::bad_request(format!("response `{response_id}` not found"))
-        })?;
-    Ok((
-        StatusCode::OK,
-        Json(json!({
-            "object": "list",
-            "data": stored.input_items,
-            "has_more": false,
-            "first_id": null,
-            "last_id": null,
-        })),
-    )
-        .into_response())
-}
-
-async fn delete_response(
-    State(state): State<AppState>,
-    Path(response_id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Response, ProxyError> {
-    authorize(&state.settings, &headers)?;
-    let deleted = state.store.delete(&response_id).await?.is_some();
-    if !deleted {
-        return Err(ProxyError::bad_request(format!(
-            "response `{response_id}` not found"
-        )));
-    }
-    Ok((
-        StatusCode::OK,
-        Json(json!({"id": response_id, "object": "response.deleted", "deleted": true})),
-    )
-        .into_response())
-}
-
-async fn cancel_response(
-    State(state): State<AppState>,
-    Path(response_id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Response, ProxyError> {
-    authorize(&state.settings, &headers)?;
-    let Some(stored) = state.store.get(&response_id).await? else {
-        return Err(ProxyError::bad_request(format!(
-            "response `{response_id}` not found"
-        )));
-    };
-
-    let status = stored
-        .response
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("completed");
-    if status != "in_progress" {
-        return Ok((StatusCode::OK, Json(stored.response)).into_response());
-    }
-
-    let _ = state.inflight.cancel(&response_id).await;
-    let context = context_from_response(&stored.response)?;
-    let turn = assistant_turn_from_output(
-        stored
-            .response
-            .get("output")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]),
-    )?;
-    let cancelled =
-        build_cancelled_response(&context, &turn, usage_from_upstream(None), unix_timestamp());
-    state
-        .store
-        .update_response(&response_id, cancelled.clone())
-        .await?;
-    Ok((StatusCode::OK, Json(cancelled)).into_response())
-}
-
-fn stream_response(
+pub(crate) fn stream_response(
     store: ResponseStore,
     inflight: InflightRegistry,
     cancel_flag: Arc<AtomicBool>,
@@ -560,7 +365,7 @@ fn stream_response(
         .into_response()
 }
 
-fn stream_response_with_auto_tools(
+pub(crate) fn stream_response_with_auto_tools(
     upstream: UpstreamClient,
     tool_executor: ToolExecutor,
     settings: Arc<Settings>,
@@ -732,80 +537,8 @@ fn stream_response_with_auto_tools(
         .into_response()
 }
 
-enum StreamRoundOutcome {
-    Completed { turn: AssistantTurn, usage: Value },
-    Failed(String),
-    Cancelled,
-}
 
-async fn collect_stream_turn(
-    cancel_flag: &AtomicBool,
-    response: reqwest::Response,
-) -> Result<StreamRoundOutcome, ProxyError> {
-    let mut parser = SseParser::default();
-    let mut stream = response.bytes_stream();
-    let mut state = StreamState::new();
-
-    while let Some(chunk) = stream.next().await {
-        if cancel_flag.load(Ordering::SeqCst) {
-            return Ok(StreamRoundOutcome::Cancelled);
-        }
-        match chunk {
-            Ok(bytes) => {
-                let chunk_text = String::from_utf8_lossy(&bytes);
-                for event_data in parser.push(&chunk_text) {
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        return Ok(StreamRoundOutcome::Cancelled);
-                    }
-                    if event_data == "[DONE]" {
-                        return Ok(StreamRoundOutcome::Completed {
-                            turn: state.take_turn(),
-                            usage: state.usage.clone(),
-                        });
-                    }
-
-                    let value: Value = serde_json::from_str(&event_data).map_err(|err| {
-                        ProxyError::bad_request(format!("failed to parse upstream SSE JSON: {err}"))
-                    })?;
-                    if let Some(usage_value) = value.get("usage") {
-                        state.usage = usage_from_upstream(Some(usage_value));
-                    }
-                    apply_stream_delta(&mut state, &value, &stream_round_context(), &mut 0)?;
-                }
-            }
-            Err(err) => {
-                return Ok(StreamRoundOutcome::Failed(err.to_string()));
-            }
-        }
-    }
-
-    Ok(StreamRoundOutcome::Completed {
-        turn: state.take_turn(),
-        usage: state.usage.clone(),
-    })
-}
-
-fn stream_round_context() -> RequestContext {
-    RequestContext {
-        response_id: String::new(),
-        reasoning_id: String::new(),
-        message_id: String::new(),
-        created_at: 0,
-        client_model: String::new(),
-        upstream_model: String::new(),
-        stream: true,
-        store: false,
-        parallel_tool_calls: true,
-        instructions: None,
-        metadata: json!({}),
-        tool_choice: json!("auto"),
-        tools: vec![],
-        max_output_tokens: None,
-        max_tool_calls: None,
-    }
-}
-
-async fn load_previous_messages(
+pub(crate) async fn load_previous_messages(
     store: &ResponseStore,
     payload: &serde_json::Map<String, Value>,
 ) -> Result<Vec<Value>, ProxyError> {
@@ -828,7 +561,7 @@ async fn load_previous_messages(
     Ok(messages)
 }
 
-async fn store_final_response(
+pub(crate) async fn store_final_response(
     store: &ResponseStore,
     translated: &crate::translate::TranslatedRequest,
     response: Value,
@@ -849,293 +582,8 @@ async fn store_final_response(
         .await
 }
 
-fn authorize(settings: &Settings, headers: &HeaderMap) -> Result<(), ProxyError> {
-    let header = headers
-        .get("authorization")
-        .ok_or(ProxyError::Unauthorized)?
-        .to_str()
-        .map_err(|_| ProxyError::Unauthorized)?;
-    let token = header
-        .strip_prefix("Bearer ")
-        .ok_or(ProxyError::Unauthorized)?;
-    if token == settings.proxy_api_key {
-        Ok(())
-    } else {
-        warn!("authentication failed: invalid proxy API key");
-        Err(ProxyError::Unauthorized)
-    }
-}
 
-fn json_event(name: &str, sequence_number: &mut u64, mut payload: Value) -> Event {
-    if let Some(map) = payload.as_object_mut() {
-        map.insert("sequence_number".to_owned(), json!(*sequence_number));
-    }
-    *sequence_number += 1;
-    Event::default()
-        .event(name)
-        .json_data(payload)
-        .expect("valid SSE event")
-}
-
-fn finalize_stream_items(
-    assistant_turn: &AssistantTurn,
-    context: &RequestContext,
-    sequence_number: &mut u64,
-) -> Vec<Event> {
-    let mut events = Vec::new();
-    if !assistant_turn.reasoning.is_empty() {
-        events.push(json_event(
-            "response.reasoning_summary_text.done",
-            sequence_number,
-            json!({
-                "type": "response.reasoning_summary_text.done",
-                "output_index": 0,
-                "item_id": context.reasoning_id,
-                "text": assistant_turn.reasoning,
-            }),
-        ));
-        events.push(json_event(
-            "response.output_item.done",
-            sequence_number,
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": build_reasoning_item(context, "completed", &assistant_turn.reasoning),
-            }),
-        ));
-    }
-
-    if !assistant_turn.text.is_empty() || assistant_turn.tool_calls.is_empty() {
-        let message_index = reasoning_output_offset(assistant_turn);
-        events.push(json_event(
-            "response.output_text.done",
-            sequence_number,
-            json!({
-                "type": "response.output_text.done",
-                "output_index": message_index,
-                "content_index": 0,
-                "item_id": context.message_id,
-                "text": assistant_turn.text,
-                "logprobs": [],
-            }),
-        ));
-        events.push(json_event(
-            "response.content_part.done",
-            sequence_number,
-            json!({
-                "type": "response.content_part.done",
-                "output_index": message_index,
-                "content_index": 0,
-                "item_id": context.message_id,
-                "part": build_content_part(&assistant_turn.text),
-            }),
-        ));
-        events.push(json_event(
-            "response.output_item.done",
-            sequence_number,
-            json!({
-                "type": "response.output_item.done",
-                "output_index": message_index,
-                "item": build_message_item(context, "completed", &assistant_turn.text),
-            }),
-        ));
-    }
-
-    for (tool_index, tool_call) in assistant_turn.tool_calls.iter().enumerate() {
-        let output_index = message_output_offset(assistant_turn) + tool_index;
-        events.push(json_event(
-            "response.function_call_arguments.done",
-            sequence_number,
-            json!({
-                "type": "response.function_call_arguments.done",
-                "output_index": output_index,
-                "item_id": function_item_id(&tool_call.call_id),
-                "arguments": tool_call.arguments,
-            }),
-        ));
-        events.push(json_event(
-            "response.output_item.done",
-            sequence_number,
-            json!({
-                "type": "response.output_item.done",
-                "output_index": output_index,
-                "item": build_function_call_item(tool_call, "completed"),
-            }),
-        ));
-    }
-    events
-}
-
-fn apply_stream_delta(
-    state: &mut StreamState,
-    value: &Value,
-    context: &RequestContext,
-    sequence_number: &mut u64,
-) -> Result<Vec<Event>, ProxyError> {
-    let mut events = Vec::new();
-    let choice = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first());
-    let Some(choice) = choice else {
-        return Ok(events);
-    };
-    let delta = choice.get("delta").and_then(Value::as_object);
-    let Some(delta) = delta else {
-        return Ok(events);
-    };
-
-    if let Some(reasoning_delta) = extract_first_reasoning(delta) {
-        if !reasoning_delta.is_empty() {
-            if !state.reasoning_started {
-                state.reasoning_started = true;
-                events.push(json_event(
-                    "response.output_item.added",
-                    sequence_number,
-                    json!({
-                        "type": "response.output_item.added",
-                        "output_index": 0,
-                        "item": build_reasoning_item(context, "in_progress", ""),
-                    }),
-                ));
-            }
-            state.reasoning.push_str(&reasoning_delta);
-            events.push(json_event(
-                "response.reasoning_summary_text.delta",
-                sequence_number,
-                json!({
-                    "type": "response.reasoning_summary_text.delta",
-                    "output_index": 0,
-                    "item_id": context.reasoning_id,
-                    "delta": reasoning_delta,
-                }),
-            ));
-        }
-    }
-
-    if let Some(content) = delta.get("content") {
-        let delta_text = match content {
-            Value::String(text) => text.clone(),
-            Value::Array(parts) => parts
-                .iter()
-                .filter_map(|part| part.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join(""),
-            _ => String::new(),
-        };
-        if !delta_text.is_empty() {
-            if !state.message_started {
-                state.message_started = true;
-                let output_index = if state.has_reasoning() { 1 } else { 0 };
-                events.push(json_event(
-                    "response.output_item.added",
-                    sequence_number,
-                    json!({
-                        "type": "response.output_item.added",
-                        "output_index": output_index,
-                        "item": build_message_item(context, "in_progress", ""),
-                    }),
-                ));
-                events.push(json_event(
-                    "response.content_part.added",
-                    sequence_number,
-                    json!({
-                        "type": "response.content_part.added",
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "item_id": context.message_id,
-                        "part": build_content_part(""),
-                    }),
-                ));
-            }
-            state.text.push_str(&delta_text);
-            let output_index = if state.has_reasoning() { 1 } else { 0 };
-            events.push(json_event(
-                "response.output_text.delta",
-                sequence_number,
-                json!({
-                    "type": "response.output_text.delta",
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "item_id": context.message_id,
-                    "delta": delta_text,
-                    "logprobs": [],
-                }),
-            ));
-        }
-    }
-
-    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-        for raw_tool_call in tool_calls {
-            let index = raw_tool_call
-                .get("index")
-                .and_then(Value::as_u64)
-                .unwrap_or(state.tool_calls.len() as u64) as usize;
-            let output_offset = (if state.has_reasoning() { 1 } else { 0 })
-                + if state.has_message() { 1 } else { 0 };
-            let entry = state
-                .tool_calls
-                .entry(index)
-                .or_insert_with(|| StreamToolCall {
-                    call_id: raw_tool_call
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| format!("call_{}", index + 1)),
-                    name: String::new(),
-                    arguments: String::new(),
-                    added: false,
-                });
-            if let Some(id) = raw_tool_call.get("id").and_then(Value::as_str) {
-                entry.call_id = id.to_owned();
-            }
-            if let Some(function) = raw_tool_call.get("function").and_then(Value::as_object) {
-                if let Some(name) = function.get("name").and_then(Value::as_str) {
-                    entry.name = name.to_owned();
-                }
-                if let Some(arguments) = function.get("arguments") {
-                    let delta = match arguments {
-                        Value::String(text) => text.clone(),
-                        _ => arguments.to_string(),
-                    };
-                    if !delta.is_empty() {
-                        if !entry.added {
-                            entry.added = true;
-                            events.push(json_event(
-                                "response.output_item.added",
-                                sequence_number,
-                                json!({
-                                    "type": "response.output_item.added",
-                                    "output_index": output_offset + index,
-                                    "item": build_function_call_item(&ToolCall {
-                                        call_id: entry.call_id.clone(),
-                                        name: entry.name.clone(),
-                                        arguments: entry.arguments.clone(),
-                                    }, "in_progress"),
-                                }),
-                            ));
-                        }
-                        entry.arguments.push_str(&delta);
-                        events.push(json_event(
-                            "response.function_call_arguments.delta",
-                            sequence_number,
-                            json!({
-                                "type": "response.function_call_arguments.delta",
-                                "output_index": output_offset + index,
-                                "item_id": function_item_id(&entry.call_id),
-                                "delta": delta,
-                            }),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(events)
-}
-
-fn assistant_turn_from_output(output: &[Value]) -> Result<AssistantTurn, ProxyError> {
+pub(crate) fn assistant_turn_from_output(output: &[Value]) -> Result<AssistantTurn, ProxyError> {
     let mut turn = AssistantTurn::default();
     for item in output {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
@@ -1180,7 +628,7 @@ fn assistant_turn_from_output(output: &[Value]) -> Result<AssistantTurn, ProxyEr
     Ok(turn)
 }
 
-fn context_from_response(response: &Value) -> Result<RequestContext, ProxyError> {
+pub(crate) fn context_from_response(response: &Value) -> Result<RequestContext, ProxyError> {
     let output = response.get("output").and_then(Value::as_array);
     Ok(RequestContext {
         response_id: response
@@ -1256,102 +704,24 @@ fn context_from_response(response: &Value) -> Result<RequestContext, ProxyError>
     })
 }
 
-struct StreamState {
-    reasoning_started: bool,
-    message_started: bool,
-    reasoning: String,
-    text: String,
-    tool_calls: BTreeMap<usize, StreamToolCall>,
-    usage: Value,
-}
-
-impl StreamState {
-    fn new() -> Self {
-        Self {
-            reasoning_started: false,
-            message_started: false,
-            reasoning: String::new(),
-            text: String::new(),
-            tool_calls: BTreeMap::new(),
-            usage: usage_from_upstream(None),
-        }
-    }
-
-    fn take_turn(&mut self) -> AssistantTurn {
-        AssistantTurn {
-            reasoning: std::mem::take(&mut self.reasoning),
-            text: std::mem::take(&mut self.text),
-            tool_calls: self
-                .tool_calls
-                .values()
-                .map(|tc| ToolCall {
-                    call_id: tc.call_id.clone(),
-                    name: tc.name.clone(),
-                    arguments: tc.arguments.clone(),
-                })
-                .collect(),
-        }
-    }
-
-    fn has_reasoning(&self) -> bool {
-        !self.reasoning.is_empty()
-    }
-
-    fn has_message(&self) -> bool {
-        !self.text.is_empty() || self.tool_calls.is_empty()
-    }
-}
-
-#[derive(Default)]
-struct StreamToolCall {
-    call_id: String,
-    name: String,
-    arguments: String,
-    added: bool,
-}
-
-#[derive(Default)]
-struct SseParser {
-    buffer: String,
-}
-
-impl SseParser {
-    fn push(&mut self, chunk: &str) -> Vec<String> {
-        self.buffer.push_str(chunk);
-        let mut events = Vec::new();
-        while let Some(index) = self.buffer.find("\n\n") {
-            let raw: String = self.buffer.drain(..index + 2).collect();
-            if let Some(event) = parse_sse_event(&raw) {
-                events.push(event);
-            }
-        }
-        events
-    }
-}
-
-fn parse_sse_event(raw: &str) -> Option<String> {
-    let mut data_lines = Vec::new();
-    for line in raw.lines() {
-        if let Some(value) = line.strip_prefix("data:") {
-            data_lines.push(value.trim_start().to_owned());
-        }
-    }
-    if data_lines.is_empty() {
-        None
-    } else {
-        Some(data_lines.join("\n"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use axum::{Router, body::Body, http::Request, response::sse::Event, routing::post};
+    use axum::{
+        Json, Router,
+        body::Body,
+        extract::{Path, State, Request},
+        http::{HeaderMap, StatusCode},
+        response::sse::Event,
+        routing::post,
+    };
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
     use super::*;
+    use crate::handlers::{authorize, cancel_response};
+    use crate::stream::{SseParser, StreamState, apply_stream_delta, parse_sse_event};
 
     fn settings(upstream_base_url: String, image_input: bool) -> Settings {
         Settings {
