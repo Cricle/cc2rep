@@ -26,15 +26,15 @@ use crate::{
     error::ProxyError,
     probe::Capabilities,
     store::{ResponseStore, StoredResponse},
-    stream::{SseParser, StreamRoundOutcome, StreamState, apply_stream_delta, collect_stream_turn,
-             finalize_stream_items, json_event},
+    stream::{
+        SseParser, StreamRoundOutcome, StreamState, apply_stream_delta, collect_stream_turn,
+        finalize_stream_items, json_event,
+    },
     tools::{ToolExecutor, append_tool_outputs},
     translate::{
-        AssistantTurn, RequestContext, ToolCall, build_cancelled_response,
-        build_failed_response, build_history_message,
-        build_in_progress_response, build_response,
-        parse_assistant_turn_from_response,
-        unix_timestamp, usage_from_upstream,
+        AssistantTurn, RequestContext, ToolCall, build_cancelled_response, build_failed_response,
+        build_history_message, build_in_progress_response, build_response,
+        parse_assistant_turn_from_response, unix_timestamp, usage_from_upstream,
     },
     upstream::UpstreamClient,
 };
@@ -107,10 +107,12 @@ pub fn build_router(settings: Settings, capabilities: Capabilities) -> Router {
             "/v1/responses/{response_id}/input_items",
             get(crate::handlers::list_input_items),
         )
-        .route("/v1/responses/{response_id}/cancel", post(crate::handlers::cancel_response))
+        .route(
+            "/v1/responses/{response_id}/cancel",
+            post(crate::handlers::cancel_response),
+        )
         .with_state(state)
 }
-
 
 pub(crate) async fn execute_non_stream_turn(
     state: &AppState,
@@ -228,7 +230,6 @@ pub(crate) fn translated_with_request_messages(
     translated.request_messages = request_messages;
     translated
 }
-
 
 pub(crate) fn stream_response(
     store: ResponseStore,
@@ -550,7 +551,6 @@ pub(crate) fn stream_response_with_auto_tools(
         .into_response()
 }
 
-
 pub(crate) async fn load_previous_messages(
     store: &ResponseStore,
     payload: &serde_json::Map<String, Value>,
@@ -594,7 +594,6 @@ pub(crate) async fn store_final_response(
         )
         .await
 }
-
 
 pub(crate) fn assistant_turn_from_output(output: &[Value]) -> Result<AssistantTurn, ProxyError> {
     let mut turn = AssistantTurn::default();
@@ -724,7 +723,7 @@ mod tests {
     use axum::{
         Json, Router,
         body::Body,
-        extract::{Path, State, Request},
+        extract::{Path, Request, State},
         http::{HeaderMap, StatusCode},
         response::sse::Event,
         routing::post,

@@ -8,10 +8,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::{
-    app::AppState,
-    error::ProxyError,
-    protocol::analyze_protocol,
-    translate::translate_request,
+    app::AppState, error::ProxyError, protocol::analyze_protocol, translate::translate_request,
 };
 
 pub(crate) async fn healthz() -> Response {
@@ -25,19 +22,21 @@ pub(crate) async fn create_response(
 ) -> Result<Response, ProxyError> {
     authorize(&state.settings, &headers)?;
 
-    let value: Value = serde_json::from_str(&body).map_err(|err| {
-        ProxyError::bad_request(format!("invalid JSON body: {err}"))
-    })?;
+    let value: Value = serde_json::from_str(&body)
+        .map_err(|err| ProxyError::bad_request(format!("invalid JSON body: {err}")))?;
 
     let Value::Object(map) = &value else {
-        return Err(ProxyError::bad_request("request body must be a JSON object"));
+        return Err(ProxyError::bad_request(
+            "request body must be a JSON object",
+        ));
     };
 
     let report = analyze_protocol(map);
     if state.settings.strict_protocol
-        && let Some(message) = report.strict_error() {
-            return Err(ProxyError::bad_request(message));
-        }
+        && let Some(message) = report.strict_error()
+    {
+        return Err(ProxyError::bad_request(message));
+    }
     let previous_messages = crate::app::load_previous_messages(&state.store, map).await?;
     let translated = translate_request(
         map,
@@ -218,8 +217,9 @@ pub(crate) async fn cancel_response(
         },
         stored.request_messages.clone(),
     );
-    if let Err(err) = crate::app::store_final_response(&state.store, &translated, cancelled_response.clone())
-        .await
+    if let Err(err) =
+        crate::app::store_final_response(&state.store, &translated, cancelled_response.clone())
+            .await
     {
         warn!(response_id = %response_id, "failed to store cancelled response: {err}");
     }

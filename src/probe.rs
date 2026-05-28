@@ -208,25 +208,25 @@ pub async fn probe_upstream(settings: &Settings) -> Capabilities {
 fn check_reasoning_support(body: &str, caps: &mut Capabilities) {
     if let Ok(value) = serde_json::from_str::<Value>(body)
         && let Some(choices) = value.get("choices").and_then(Value::as_array)
-            && let Some(message) = choices
-                .first()
-                .and_then(|c| c.get("message"))
-                .and_then(Value::as_object)
-            {
-                for key in ["reasoning_content", "reasoning", "thinking"] {
-                    if let Some(val) = message.get(key) {
-                        let has_content = match val {
-                            Value::String(s) => !s.is_empty(),
-                            Value::Array(a) => !a.is_empty(),
-                            Value::Null => false,
-                            _ => true,
-                        };
-                        if has_content {
-                            info!("upstream supports reasoning content (found `{key}`)");
-                            caps.supports_reasoning_content = true;
-                            return;
-                        }
-                    }
+        && let Some(message) = choices
+            .first()
+            .and_then(|c| c.get("message"))
+            .and_then(Value::as_object)
+    {
+        for key in ["reasoning_content", "reasoning", "thinking"] {
+            if let Some(val) = message.get(key) {
+                let has_content = match val {
+                    Value::String(s) => !s.is_empty(),
+                    Value::Array(a) => !a.is_empty(),
+                    Value::Null => false,
+                    _ => true,
+                };
+                if has_content {
+                    info!("upstream supports reasoning content (found `{key}`)");
+                    caps.supports_reasoning_content = true;
+                    return;
                 }
             }
+        }
+    }
 }

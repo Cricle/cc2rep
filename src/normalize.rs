@@ -4,9 +4,7 @@ use crate::{
     config::Settings,
     error::ProxyError,
     probe::Capabilities,
-    translate::{
-        extract_first_reasoning, flatten_reasoning_value, stringify_json_value,
-    },
+    translate::{extract_first_reasoning, flatten_reasoning_value, stringify_json_value},
 };
 
 pub(crate) fn normalize_input_items(

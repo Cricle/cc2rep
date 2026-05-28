@@ -88,10 +88,7 @@ impl StreamState {
 }
 
 pub(crate) enum StreamRoundOutcome {
-    Completed {
-        turn: AssistantTurn,
-        usage: Value,
-    },
+    Completed { turn: AssistantTurn, usage: Value },
     Failed(String),
     Cancelled,
 }
@@ -116,11 +113,7 @@ pub(crate) fn stream_round_context() -> RequestContext {
     }
 }
 
-pub(crate) fn json_event(
-    name: &str,
-    sequence_number: &mut u64,
-    mut payload: Value,
-) -> Event {
+pub(crate) fn json_event(name: &str, sequence_number: &mut u64, mut payload: Value) -> Event {
     if let Some(map) = payload.as_object_mut() {
         map.insert("sequence_number".to_owned(), json!(*sequence_number));
     }
@@ -240,31 +233,32 @@ pub(crate) fn apply_stream_delta(
     };
 
     if let Some(reasoning_delta) = extract_first_reasoning(delta)
-        && !reasoning_delta.is_empty() {
-            if !state.reasoning_started {
-                state.reasoning_started = true;
-                events.push(json_event(
-                    "response.output_item.added",
-                    sequence_number,
-                    json!({
-                        "type": "response.output_item.added",
-                        "output_index": 0,
-                        "item": build_reasoning_item(context, "in_progress", ""),
-                    }),
-                ));
-            }
-            state.reasoning.push_str(&reasoning_delta);
+        && !reasoning_delta.is_empty()
+    {
+        if !state.reasoning_started {
+            state.reasoning_started = true;
             events.push(json_event(
-                "response.reasoning_summary_text.delta",
+                "response.output_item.added",
                 sequence_number,
                 json!({
-                    "type": "response.reasoning_summary_text.delta",
+                    "type": "response.output_item.added",
                     "output_index": 0,
-                    "item_id": context.reasoning_id,
-                    "delta": reasoning_delta,
+                    "item": build_reasoning_item(context, "in_progress", ""),
                 }),
             ));
         }
+        state.reasoning.push_str(&reasoning_delta);
+        events.push(json_event(
+            "response.reasoning_summary_text.delta",
+            sequence_number,
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "item_id": context.reasoning_id,
+                "delta": reasoning_delta,
+            }),
+        ));
+    }
 
     if let Some(content) = delta.get("content") {
         let delta_text = match content {
@@ -376,18 +370,19 @@ pub(crate) fn apply_stream_delta(
                     .get("function")
                     .and_then(|f| f.get("arguments"))
                     .and_then(Value::as_str)
-                    && !args.is_empty() {
-                        events.push(json_event(
-                            "response.function_call_arguments.delta",
-                            sequence_number,
-                            json!({
-                                "type": "response.function_call_arguments.delta",
-                                "output_index": output_index,
-                                "item_id": function_item_id(&call_id),
-                                "delta": args,
-                            }),
-                        ));
-                    }
+                    && !args.is_empty()
+                {
+                    events.push(json_event(
+                        "response.function_call_arguments.delta",
+                        sequence_number,
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": output_index,
+                            "item_id": function_item_id(&call_id),
+                            "delta": args,
+                        }),
+                    ));
+                }
             }
         }
     }

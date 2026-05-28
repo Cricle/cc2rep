@@ -16,9 +16,8 @@ use crate::{
 
 // Re-export from response module for backward compatibility
 pub use crate::response::{
-    build_cancelled_response, build_content_part, build_failed_response,
-    build_function_call_item, build_in_progress_response, build_message_item,
-    build_reasoning_item, build_response,
+    build_cancelled_response, build_content_part, build_failed_response, build_function_call_item,
+    build_in_progress_response, build_message_item, build_reasoning_item, build_response,
 };
 
 #[derive(Debug, Clone)]
@@ -243,18 +242,19 @@ pub fn build_history_message(turn: &AssistantTurn) -> Option<Value> {
         "content": if turn.text.is_empty() { Value::Null } else { Value::String(turn.text.clone()) },
     });
     if !turn.tool_calls.is_empty() {
-        message["tool_calls"] = json!(turn
-            .tool_calls
-            .iter()
-            .map(|tc| json!({
-                "id": tc.call_id,
-                "type": "function",
-                "function": {
-                    "name": tc.name,
-                    "arguments": tc.arguments,
-                }
-            }))
-            .collect::<Vec<_>>());
+        message["tool_calls"] = json!(
+            turn.tool_calls
+                .iter()
+                .map(|tc| json!({
+                    "id": tc.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                    }
+                }))
+                .collect::<Vec<_>>()
+        );
     }
     if !turn.reasoning.is_empty() {
         message["reasoning_content"] = Value::String(turn.reasoning.clone());
@@ -284,11 +284,7 @@ pub fn function_item_id(call_id: &str) -> String {
 }
 
 pub fn reasoning_output_offset(turn: &AssistantTurn) -> usize {
-    if turn.reasoning.is_empty() {
-        0
-    } else {
-        1
-    }
+    if turn.reasoning.is_empty() { 0 } else { 1 }
 }
 
 pub fn message_output_offset(turn: &AssistantTurn) -> usize {
@@ -388,9 +384,10 @@ pub fn extract_first_reasoning(map: &Map<String, Value>) -> Option<String> {
     ] {
         if let Some(value) = map.get(key)
             && let Some(reasoning) = flatten_reasoning_value(value)
-                && !reasoning.is_empty() {
-                    return Some(reasoning);
-                }
+            && !reasoning.is_empty()
+        {
+            return Some(reasoning);
+        }
     }
     None
 }
@@ -420,9 +417,10 @@ pub fn flatten_reasoning_value(value: &Value) -> Option<String> {
         Value::Object(map) => {
             for key in ["text", "content", "summary", "reasoning_content"] {
                 if let Some(value) = map.get(key)
-                    && let Some(text) = flatten_reasoning_value(value) {
-                        return Some(text);
-                    }
+                    && let Some(text) = flatten_reasoning_value(value)
+                {
+                    return Some(text);
+                }
             }
             None
         }

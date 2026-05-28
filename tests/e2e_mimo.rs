@@ -1,12 +1,12 @@
-use axum::{body::Body, http::Request, Router};
+use axum::{Router, body::Body, http::Request};
 use http::StatusCode;
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::LazyLock;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 
-use cc2rep::{build_router, probe::probe_upstream, Settings};
+use cc2rep::{Settings, build_router, probe::probe_upstream};
 
 const PROXY_KEY: &str = "test-proxy-key";
 const MIMO_BASE_URL: &str = "https://token-plan-cn.xiaomimimo.com/v1";
@@ -130,12 +130,20 @@ async fn send_json(router: &Router, body: Value) -> Value {
         rate_limit().await;
         let response = send(router, responses_request(&body)).await;
         if response.status() == StatusCode::TOO_MANY_REQUESTS && attempt < 3 {
-            eprintln!("429 rate limited, retrying in 10s (attempt {})", attempt + 1);
+            eprintln!(
+                "429 rate limited, retrying in 10s (attempt {})",
+                attempt + 1
+            );
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             continue;
         }
         assert_eq!(response.status(), StatusCode::OK, "request failed");
-        let bytes = response.into_body().collect().await.expect("collect").to_bytes();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect")
+            .to_bytes();
         return serde_json::from_slice(&bytes).expect("json");
     }
     panic!("too many 429 retries");
@@ -145,7 +153,12 @@ async fn send_json_expect_error(router: &Router, body: Value) -> (StatusCode, Va
     rate_limit().await;
     let response = send(router, responses_request(&body)).await;
     let status = response.status();
-    let bytes = response.into_body().collect().await.expect("collect").to_bytes();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect")
+        .to_bytes();
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
     (status, body)
 }
@@ -155,17 +168,28 @@ async fn send_stream(router: &Router, body: Value) -> Vec<Value> {
         rate_limit().await;
         let response = send(router, responses_request(&body)).await;
         if response.status() == StatusCode::TOO_MANY_REQUESTS && attempt < 3 {
-            eprintln!("429 rate limited, retrying in 10s (attempt {})", attempt + 1);
+            eprintln!(
+                "429 rate limited, retrying in 10s (attempt {})",
+                attempt + 1
+            );
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             continue;
         }
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = response.into_body().collect().await.expect("collect").to_bytes();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect")
+            .to_bytes();
         let text = String::from_utf8_lossy(&bytes);
-        return text.lines()
+        return text
+            .lines()
             .filter_map(|line| {
                 let stripped = line.strip_prefix("data: ")?;
-                if stripped == "[DONE]" { return None; }
+                if stripped == "[DONE]" {
+                    return None;
+                }
                 serde_json::from_str(stripped).ok()
             })
             .collect();
@@ -175,11 +199,7 @@ async fn send_stream(router: &Router, body: Value) -> Vec<Value> {
 
 /// Helper: get the last message text from a non-streaming response body.
 fn last_message_text(body: &Value) -> &str {
-    body["output"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap()["content"][0]["text"]
+    body["output"].as_array().unwrap().last().unwrap()["content"][0]["text"]
         .as_str()
         .unwrap()
 }
@@ -191,7 +211,9 @@ fn last_message_text(body: &Value) -> &str {
 #[tokio::test]
 async fn healthz_returns_ok() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let response = send(
         router,
         Request::builder()
@@ -218,7 +240,9 @@ async fn healthz_returns_ok() {
 #[tokio::test]
 async fn missing_auth_returns_401() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let response = send(
         router,
         Request::builder()
@@ -235,7 +259,9 @@ async fn missing_auth_returns_401() {
 #[tokio::test]
 async fn wrong_auth_returns_401() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let response = send(
         router,
         Request::builder()
@@ -257,7 +283,9 @@ async fn wrong_auth_returns_401() {
 #[tokio::test]
 async fn non_stream_basic_completion() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -294,7 +322,9 @@ async fn non_stream_basic_completion() {
 #[tokio::test]
 async fn stream_basic_completion() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let events = send_stream(
         router,
         json!({
@@ -323,9 +353,9 @@ async fn stream_basic_completion() {
     assert!(has_text_delta, "should have text deltas");
 
     // Should have output_item.added for message
-    let has_message = events.iter().any(|e| {
-        e["type"] == "response.output_item.added" && e["item"]["type"] == "message"
-    });
+    let has_message = events
+        .iter()
+        .any(|e| e["type"] == "response.output_item.added" && e["item"]["type"] == "message");
     assert!(has_message, "should have message item");
 }
 
@@ -336,7 +366,9 @@ async fn stream_basic_completion() {
 #[tokio::test]
 async fn non_stream_reasoning_content() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -371,7 +403,9 @@ async fn non_stream_reasoning_content() {
 #[tokio::test]
 async fn stream_reasoning_content() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let events = send_stream(
         router,
         json!({
@@ -383,9 +417,9 @@ async fn stream_reasoning_content() {
     .await;
 
     // Should have reasoning item added
-    let has_reasoning = events.iter().any(|e| {
-        e["type"] == "response.output_item.added" && e["item"]["type"] == "reasoning"
-    });
+    let has_reasoning = events
+        .iter()
+        .any(|e| e["type"] == "response.output_item.added" && e["item"]["type"] == "reasoning");
     assert!(has_reasoning, "should have reasoning item in stream");
 
     // Should have reasoning summary text deltas
@@ -402,7 +436,9 @@ async fn stream_reasoning_content() {
 #[tokio::test]
 async fn non_stream_tool_choice_auto() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -431,7 +467,9 @@ async fn non_stream_tool_choice_auto() {
 #[tokio::test]
 async fn non_stream_tool_choice_required() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -457,15 +495,16 @@ async fn non_stream_tool_choice_required() {
     assert_eq!(fc["name"], "get_weather");
     assert!(fc["call_id"].as_str().unwrap().starts_with("call_"));
 
-    let args: Value =
-        serde_json::from_str(fc["arguments"].as_str().unwrap()).expect("args json");
+    let args: Value = serde_json::from_str(fc["arguments"].as_str().unwrap()).expect("args json");
     assert!(args["city"].as_str().is_some(), "should have city argument");
 }
 
 #[tokio::test]
 async fn non_stream_named_tool_choice() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -492,7 +531,9 @@ async fn non_stream_named_tool_choice() {
 #[tokio::test]
 async fn non_stream_multiple_tools() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -530,7 +571,9 @@ async fn non_stream_multiple_tools() {
 #[tokio::test]
 async fn stream_tool_calls() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let events = send_stream(
         router,
         json!({
@@ -562,7 +605,9 @@ async fn stream_tool_calls() {
 async fn local_tool_auto_execution() {
     require_api_key!();
     let _guard = rate_limit().await;
-    let Some(mut settings) = mimo_settings() else { return; };
+    let Some(mut settings) = mimo_settings() else {
+        return;
+    };
     settings.local_tools.insert(
         "get_weather".to_owned(),
         cc2rep::config::LocalToolSettings {
@@ -619,7 +664,9 @@ async fn local_tool_auto_execution() {
 #[tokio::test]
 async fn non_stream_multi_turn() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -649,7 +696,9 @@ async fn non_stream_multi_turn() {
 #[tokio::test]
 async fn non_stream_instructions() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -682,7 +731,9 @@ async fn non_stream_instructions() {
 #[tokio::test]
 async fn previous_response_id() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
 
     // First request
     let body1 = send_json(
@@ -724,7 +775,9 @@ async fn previous_response_id() {
 async fn model_alias() {
     require_api_key!();
     let _guard = rate_limit().await;
-    let Some(mut settings) = mimo_settings() else { return; };
+    let Some(mut settings) = mimo_settings() else {
+        return;
+    };
     settings
         .model_aliases
         .insert("my-alias".to_owned(), MIMO_MODEL.to_owned());
@@ -752,7 +805,9 @@ async fn model_alias() {
 #[tokio::test]
 async fn response_get_and_delete() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
 
     // Create response
     let body = send_json(
@@ -820,7 +875,9 @@ async fn response_get_and_delete() {
 #[tokio::test]
 async fn response_list_input_items() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
 
     let body = send_json(
         router,
@@ -863,7 +920,9 @@ async fn response_list_input_items() {
 #[tokio::test]
 async fn cancel_nonexistent_returns_400() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let response = send(
         router,
         Request::builder()
@@ -884,7 +943,9 @@ async fn cancel_nonexistent_returns_400() {
 #[tokio::test]
 async fn non_object_body_returns_400() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let response = send(
         router,
         Request::builder()
@@ -902,7 +963,9 @@ async fn non_object_body_returns_400() {
 #[tokio::test]
 async fn missing_input_returns_400() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let (status, _) = send_json_expect_error(
         router,
         json!({
@@ -916,7 +979,9 @@ async fn missing_input_returns_400() {
 #[tokio::test]
 async fn delete_missing_returns_400() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let response = send(
         router,
         Request::builder()
@@ -933,7 +998,9 @@ async fn delete_missing_returns_400() {
 #[tokio::test]
 async fn get_missing_returns_400() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let response = send(
         router,
         Request::builder()
@@ -955,7 +1022,9 @@ async fn get_missing_returns_400() {
 async fn drop_tools_ignores_tool_definitions() {
     require_api_key!();
     let _guard = rate_limit().await;
-    let Some(mut settings) = mimo_settings() else { return; };
+    let Some(mut settings) = mimo_settings() else {
+        return;
+    };
     settings.drop_tools = true;
     let caps = probe_upstream(&settings).await;
     let router = build_router(settings, caps);
@@ -989,7 +1058,9 @@ async fn drop_tools_ignores_tool_definitions() {
 #[tokio::test]
 async fn store_false_not_persisted() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -1024,7 +1095,9 @@ async fn store_false_not_persisted() {
 #[tokio::test]
 async fn parallel_tool_calls_setting() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -1046,7 +1119,9 @@ async fn parallel_tool_calls_setting() {
 #[tokio::test]
 async fn response_has_correct_format() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -1067,7 +1142,9 @@ async fn response_has_correct_format() {
 #[tokio::test]
 async fn usage_fields_present() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -1082,12 +1159,16 @@ async fn usage_fields_present() {
     assert!(usage["input_tokens"].as_u64().unwrap() > 0);
     assert!(usage["output_tokens"].as_u64().unwrap() > 0);
     assert!(usage["total_tokens"].as_u64().unwrap() > 0);
-    assert!(usage["input_tokens_details"]["cached_tokens"]
-        .as_u64()
-        .is_some());
-    assert!(usage["output_tokens_details"]["reasoning_tokens"]
-        .as_u64()
-        .is_some());
+    assert!(
+        usage["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(
+        usage["output_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .is_some()
+    );
 }
 
 // ============================================================
@@ -1097,7 +1178,9 @@ async fn usage_fields_present() {
 #[tokio::test]
 async fn stream_output_item_order() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let events = send_stream(
         router,
         json!({
@@ -1109,9 +1192,7 @@ async fn stream_output_item_order() {
     .await;
 
     // Find indices of key events
-    let created_idx = events
-        .iter()
-        .position(|e| e["type"] == "response.created");
+    let created_idx = events.iter().position(|e| e["type"] == "response.created");
     let completed_idx = events
         .iter()
         .position(|e| e["type"] == "response.completed");
@@ -1127,9 +1208,9 @@ async fn stream_output_item_order() {
     let reasoning_idx = events.iter().position(|e| {
         e["type"] == "response.output_item.added" && e["item"]["type"] == "reasoning"
     });
-    let message_idx = events.iter().position(|e| {
-        e["type"] == "response.output_item.added" && e["item"]["type"] == "message"
-    });
+    let message_idx = events
+        .iter()
+        .position(|e| e["type"] == "response.output_item.added" && e["item"]["type"] == "message");
 
     if let (Some(ri), Some(mi)) = (reasoning_idx, message_idx) {
         assert!(ri < mi, "reasoning should come before message");
@@ -1143,7 +1224,9 @@ async fn stream_output_item_order() {
 #[tokio::test]
 async fn string_input_works() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -1159,7 +1242,9 @@ async fn string_input_works() {
 #[tokio::test]
 async fn array_input_works() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -1179,7 +1264,9 @@ async fn array_input_works() {
 #[tokio::test]
 async fn max_output_tokens_zero_is_ignored() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -1196,7 +1283,9 @@ async fn max_output_tokens_zero_is_ignored() {
 #[tokio::test]
 async fn temperature_and_top_p_passed_through() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
@@ -1214,7 +1303,9 @@ async fn temperature_and_top_p_passed_through() {
 #[tokio::test]
 async fn stop_sequences_passed_through() {
     require_api_key!();
-    let Some(router) = shared_router().await else { return; };
+    let Some(router) = shared_router().await else {
+        return;
+    };
     let body = send_json(
         router,
         json!({
