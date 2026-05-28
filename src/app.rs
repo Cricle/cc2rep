@@ -26,6 +26,7 @@ use tracing::{info, warn};
 use crate::{
     config::Settings,
     error::ProxyError,
+    probe::Capabilities,
     protocol::analyze_protocol,
     store::{ResponseStore, StoredResponse},
     tools::{ToolExecutor, append_tool_outputs},
@@ -43,6 +44,7 @@ use crate::{
 #[derive(Clone)]
 struct AppState {
     settings: Arc<Settings>,
+    capabilities: Capabilities,
     upstream: UpstreamClient,
     tool_executor: ToolExecutor,
     store: ResponseStore,
@@ -82,14 +84,17 @@ impl InflightRegistry {
     }
 }
 
-pub fn build_router(settings: Settings) -> Router {
+pub fn build_router(settings: Settings, capabilities: Capabilities) -> Router {
     let settings = Arc::new(settings);
     let upstream = UpstreamClient::new(settings.clone()).expect("invalid settings");
+    let store = ResponseStore::with_ttl(settings.response_ttl_seconds);
+    store.start_cleanup_task();
     let state = AppState {
         tool_executor: ToolExecutor::new(settings.clone()),
+        store,
+        capabilities,
         settings,
         upstream,
-        store: ResponseStore::default(),
         inflight: InflightRegistry::default(),
     };
 
@@ -130,7 +135,13 @@ async fn create_response(
     }
 
     let previous_messages = load_previous_messages(&state.store, object).await?;
-    let translated = translate_request(object, &state.settings, &report, &previous_messages)?;
+    let translated = translate_request(
+        object,
+        &state.settings,
+        &report,
+        &previous_messages,
+        &state.capabilities,
+    )?;
     info!(
         response_id = %translated.context.response_id,
         model = %translated.context.upstream_model,
@@ -147,6 +158,7 @@ async fn create_response(
                     response: build_in_progress_response(&translated.context),
                     input_items: translated.input_items.clone(),
                     request_messages: translated.request_messages.clone(),
+                    inserted_at: std::time::Instant::now(),
                 },
             )
             .await?;
@@ -217,19 +229,31 @@ async fn execute_non_stream_turn(
         });
     }
 
+    let max_tool_calls = translated.context.max_tool_calls;
+    let mut total_tool_calls: u32 = 0;
+
     for _ in 0..state.settings.max_auto_tool_rounds {
-        if turn.tool_calls.is_empty() {
-            break;
-        }
-        if !turn
+        let supported: Vec<_> = turn
             .tool_calls
             .iter()
-            .all(|tool_call| state.tool_executor.supports_tool(&tool_call.name))
-        {
+            .filter(|tc| state.tool_executor.supports_tool(&tc.name))
+            .cloned()
+            .collect();
+        if supported.is_empty() {
             break;
         }
+        if let Some(limit) = max_tool_calls {
+            total_tool_calls += supported.len() as u32;
+            if total_tool_calls > limit {
+                break;
+            }
+        }
 
-        let Some(outputs) = state.tool_executor.execute_calls(&turn.tool_calls).await? else {
+        let Some(outputs) = state
+            .tool_executor
+            .execute_calls(&supported, translated.context.parallel_tool_calls)
+            .await?
+        else {
             break;
         };
         {
@@ -250,7 +274,7 @@ async fn execute_non_stream_turn(
                     request_messages: translated.request_messages.clone(),
                 });
             };
-            append_tool_outputs(messages, &turn.tool_calls, &outputs, Some(&turn.reasoning));
+            append_tool_outputs(messages, &supported, &outputs, Some(&turn.reasoning));
         }
 
         last_upstream = state.upstream.chat_json(&upstream_payload).await?;
@@ -561,6 +585,9 @@ fn stream_response_with_auto_tools(
         let mut final_usage = usage_from_upstream(None);
         let mut failed_message: Option<String> = None;
         let mut cancelled = false;
+        let max_tool_calls = context.max_tool_calls;
+        let mut total_tool_calls: u32 = 0;
+        let parallel = context.parallel_tool_calls;
 
         for _ in 0..settings.max_auto_tool_rounds {
             match collect_stream_turn(&cancel_flag, current_response).await {
@@ -573,18 +600,27 @@ fn stream_response_with_auto_tools(
                     break;
                 }
                 Ok(StreamRoundOutcome::Completed { turn, usage }) => {
-                    if turn.tool_calls.is_empty()
-                        || !turn
-                            .tool_calls
-                            .iter()
-                            .all(|tool_call| tool_executor.supports_tool(&tool_call.name))
-                    {
+                    let supported: Vec<_> = turn
+                        .tool_calls
+                        .iter()
+                        .filter(|tc| tool_executor.supports_tool(&tc.name))
+                        .cloned()
+                        .collect();
+                    if supported.is_empty() {
                         final_turn = turn;
                         final_usage = usage;
                         break;
                     }
+                    if let Some(limit) = max_tool_calls {
+                        total_tool_calls += supported.len() as u32;
+                        if total_tool_calls > limit {
+                            final_turn = turn;
+                            final_usage = usage;
+                            break;
+                        }
+                    }
 
-                    let outputs = match tool_executor.execute_calls(&turn.tool_calls).await {
+                    let outputs = match tool_executor.execute_calls(&supported, parallel).await {
                         Ok(Some(outputs)) => outputs,
                         Ok(None) => {
                             final_turn = turn;
@@ -609,7 +645,7 @@ fn stream_response_with_auto_tools(
                         };
                         append_tool_outputs(
                             messages,
-                            &turn.tool_calls,
+                            &supported,
                             &outputs,
                             Some(&turn.reasoning),
                         );
@@ -765,6 +801,7 @@ fn stream_round_context() -> RequestContext {
         tool_choice: json!("auto"),
         tools: vec![],
         max_output_tokens: None,
+        max_tool_calls: None,
     }
 }
 
@@ -806,6 +843,7 @@ async fn store_final_response(
                 response,
                 input_items: translated.input_items.clone(),
                 request_messages: translated.request_messages.clone(),
+                inserted_at: std::time::Instant::now(),
             },
         )
         .await
@@ -1211,6 +1249,10 @@ fn context_from_response(response: &Value) -> Result<RequestContext, ProxyError>
             .cloned()
             .unwrap_or_default(),
         max_output_tokens: response.get("max_output_tokens").and_then(Value::as_u64),
+        max_tool_calls: response
+            .get("max_tool_calls")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32),
     })
 }
 
@@ -1326,9 +1368,10 @@ mod tests {
             request_timeout_seconds: 10.0,
             strict_protocol: false,
             upstream_supports_image_input: image_input,
-            upstream_supports_reasoning_content: false,
-            upstream_supports_tool_choice_required: false,
-            upstream_supports_named_tool_choice: false,
+            upstream_supports_reasoning_content: None,
+            upstream_supports_tool_choice_required: None,
+            upstream_supports_named_tool_choice: None,
+            response_ttl_seconds: 3600,
             drop_input_reasoning: false,
             drop_tools: false,
             upstream_body: Default::default(),
@@ -1337,6 +1380,15 @@ mod tests {
                 .collect(),
             local_tools: Default::default(),
             max_auto_tool_rounds: 8,
+        }
+    }
+
+    fn caps(image_input: bool) -> Capabilities {
+        Capabilities {
+            supports_named_tool_choice: false,
+            supports_tool_choice_required: false,
+            supports_reasoning_content: false,
+            supports_image_input: image_input,
         }
     }
 
@@ -1414,7 +1466,7 @@ mod tests {
     #[tokio::test]
     async fn non_stream_reasoning_is_mapped_to_output_item() {
         let upstream_base_url = spawn_upstream().await;
-        let router = build_router(settings(upstream_base_url, false));
+        let router = build_router(settings(upstream_base_url, false), caps(false));
 
         let response = send(
             &router,
@@ -1445,7 +1497,7 @@ mod tests {
     #[tokio::test]
     async fn stream_reasoning_events_are_emitted() {
         let upstream_base_url = spawn_upstream().await;
-        let router = build_router(settings(upstream_base_url, false));
+        let router = build_router(settings(upstream_base_url, false), caps(false));
 
         let response = send(
             &router,
@@ -1480,7 +1532,7 @@ mod tests {
     #[tokio::test]
     async fn image_input_requires_flag() {
         let upstream_base_url = spawn_upstream().await;
-        let router = build_router(settings(upstream_base_url, false));
+        let router = build_router(settings(upstream_base_url, false), caps(false));
 
         let response = send(
             &router,
@@ -1510,7 +1562,7 @@ mod tests {
     #[tokio::test]
     async fn image_input_is_forwarded_when_enabled() {
         let upstream_base_url = spawn_upstream().await;
-        let router = build_router(settings(upstream_base_url, true));
+        let router = build_router(settings(upstream_base_url, true), caps(true));
 
         let response = send(
             &router,
@@ -1548,7 +1600,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_marks_inflight_stream_as_cancelled() {
         let upstream_base_url = spawn_upstream().await;
-        let router = build_router(settings(upstream_base_url, false));
+        let router = build_router(settings(upstream_base_url, false), caps(false));
 
         let create = send(
             &router,
@@ -1613,7 +1665,7 @@ mod tests {
     #[tokio::test]
     async fn healthz_and_auth_and_response_crud_work() {
         let upstream_base_url = spawn_upstream().await;
-        let router = build_router(settings(upstream_base_url, false));
+        let router = build_router(settings(upstream_base_url, false), caps(false));
 
         let health = send(
             &router,
@@ -1763,7 +1815,7 @@ mod tests {
             }),
         );
         let upstream_base_url = spawn_upstream_with_router(upstream).await;
-        let router = build_router(settings(upstream_base_url.clone(), false));
+        let router = build_router(settings(upstream_base_url.clone(), false), caps(false));
 
         let first = send(
             &router,
@@ -1817,7 +1869,7 @@ mod tests {
 
         let mut strict = settings(upstream_base_url, false);
         strict.strict_protocol = true;
-        let strict_router = build_router(strict);
+        let strict_router = build_router(strict, caps(false));
         let strict_response = send(
             &strict_router,
             Request::builder()
@@ -1884,7 +1936,7 @@ mod tests {
             }),
         );
         let upstream_base_url = spawn_upstream_with_router(upstream).await;
-        let router = build_router(settings(upstream_base_url, false));
+        let router = build_router(settings(upstream_base_url, false), caps(false));
 
         let first = send(
             &router,
@@ -2026,7 +2078,7 @@ mod tests {
                 output_json: true,
             },
         );
-        let router = build_router(settings);
+        let router = build_router(settings, caps(false));
 
         let response = send(
             &router,
@@ -2101,7 +2153,7 @@ mod tests {
                 output_json: true,
             },
         );
-        let router = build_router(settings);
+        let router = build_router(settings, caps(false));
 
         let response = send(
             &router,
@@ -2151,10 +2203,10 @@ mod tests {
             "/v1/chat/completions",
             post(|| async { "data: {not-json}\n\n" }),
         );
-        let parse_router = build_router(settings(
-            spawn_upstream_with_router(parse_router).await,
-            false,
-        ));
+        let parse_router = build_router(
+            settings(spawn_upstream_with_router(parse_router).await, false),
+            caps(false),
+        );
         let parse_response = send(
             &parse_router,
             Request::builder()
@@ -2182,10 +2234,10 @@ mod tests {
             "/v1/chat/completions",
             post(|| async { Json(json!({"not_choices":true})) }),
         );
-        let bad_json_router = build_router(settings(
-            spawn_upstream_with_router(bad_json_router).await,
-            false,
-        ));
+        let bad_json_router = build_router(
+            settings(spawn_upstream_with_router(bad_json_router).await, false),
+            caps(false),
+        );
         let bad_json_response = send(
             &bad_json_router,
             Request::builder()
@@ -2239,6 +2291,7 @@ mod tests {
             tool_choice: json!("auto"),
             tools: vec![],
             max_output_tokens: None,
+            max_tool_calls: None,
         };
         let events = finalize_stream_items(&turn, &context, &mut 0);
         assert_eq!(events.len(), 7);
@@ -2393,7 +2446,7 @@ mod tests {
         let upstream_base_url = spawn_upstream().await;
         let mut strict = settings(upstream_base_url.clone(), false);
         strict.strict_protocol = true;
-        let strict_router = build_router(strict);
+        let strict_router = build_router(strict, caps(false));
 
         let supported_in_strict = send(
             &strict_router,
@@ -2421,7 +2474,7 @@ mod tests {
         .await;
         assert_eq!(non_object.status(), StatusCode::BAD_REQUEST);
 
-        let router = build_router(settings(upstream_base_url, false));
+        let router = build_router(settings(upstream_base_url, false), caps(false));
         let missing_delete = send(
             &router,
             Request::builder()
@@ -2436,6 +2489,7 @@ mod tests {
 
         let app_state = AppState {
             settings: Arc::new(settings("http://127.0.0.1:1".to_owned(), false)),
+            capabilities: caps(false),
             upstream: UpstreamClient::new(Arc::new(settings(
                 "http://127.0.0.1:1".to_owned(),
                 false,
@@ -2471,6 +2525,7 @@ mod tests {
                     }),
                     input_items: vec![],
                     request_messages: vec![json!({"role":"user","content":"hi"})],
+                    inserted_at: std::time::Instant::now(),
                 },
             )
             .await
@@ -2509,6 +2564,7 @@ mod tests {
                     }),
                     input_items: vec![],
                     request_messages: vec![],
+                    inserted_at: std::time::Instant::now(),
                 },
             )
             .await
@@ -2530,6 +2586,7 @@ mod tests {
                     response: json!({"id":"resp_prev"}),
                     input_items: vec![],
                     request_messages: vec![json!({"role":"user","content":"hi"})],
+                    inserted_at: std::time::Instant::now(),
                 },
             )
             .await
@@ -2573,6 +2630,7 @@ mod tests {
             tool_choice: json!("auto"),
             tools: vec![],
             max_output_tokens: None,
+            max_tool_calls: None,
         };
         let events = apply_stream_delta(
             &mut state,

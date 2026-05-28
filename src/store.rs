@@ -1,13 +1,16 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use serde_json::Value;
 use tokio::sync::RwLock;
+use tokio::time::{Duration, interval};
+use tracing::{debug, info};
 
 use crate::error::ProxyError;
 
 #[derive(Clone, Default)]
 pub struct ResponseStore {
     inner: Arc<RwLock<HashMap<String, StoredResponse>>>,
+    ttl_seconds: Arc<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -15,11 +18,31 @@ pub struct StoredResponse {
     pub response: Value,
     pub input_items: Vec<Value>,
     pub request_messages: Vec<Value>,
+    pub inserted_at: Instant,
 }
 
 impl ResponseStore {
+    pub fn with_ttl(ttl_seconds: u64) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+            ttl_seconds: Arc::new(ttl_seconds),
+        }
+    }
+
     pub async fn put(&self, response_id: String, stored: StoredResponse) -> Result<(), ProxyError> {
-        self.inner.write().await.insert(response_id, stored);
+        let mut guard = self.inner.write().await;
+        guard.insert(response_id, stored);
+        // Opportunistic cleanup: every 32 inserts, remove expired entries
+        if guard.len() % 32 == 0 {
+            let ttl = *self.ttl_seconds;
+            guard.retain(|id, entry| {
+                let alive = entry.inserted_at.elapsed().as_secs() < ttl;
+                if !alive {
+                    debug!(response_id = %id, "expired stored response");
+                }
+                alive
+            });
+        }
         Ok(())
     }
 
@@ -29,6 +52,38 @@ impl ResponseStore {
 
     pub async fn delete(&self, response_id: &str) -> Result<Option<StoredResponse>, ProxyError> {
         Ok(self.inner.write().await.remove(response_id))
+    }
+
+    pub fn start_cleanup_task(&self) {
+        let store = self.clone();
+        let ttl = *self.ttl_seconds;
+        if ttl == 0 {
+            info!("TTL is 0, skipping cleanup task");
+            return;
+        }
+        let interval_secs = if ttl < 60 { ttl.max(10) } else { 60 };
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(interval_secs));
+            ticker.tick().await; // skip first immediate tick
+            loop {
+                ticker.tick().await;
+                let before = store.inner.read().await.len();
+                let mut guard = store.inner.write().await;
+                guard.retain(|id, entry| {
+                    let alive = entry.inserted_at.elapsed().as_secs() < ttl;
+                    if !alive {
+                        debug!(response_id = %id, "cleanup: removed expired response");
+                    }
+                    alive
+                });
+                let after = guard.len();
+                let removed = before.saturating_sub(after);
+                if removed > 0 {
+                    info!(removed, remaining = after, "periodic cleanup completed");
+                }
+                drop(guard);
+            }
+        });
     }
 
     pub async fn update_response(
@@ -55,6 +110,7 @@ mod tests {
             response: json!({"id":"resp_1","output_text":text}),
             input_items: vec![json!({"type":"message"})],
             request_messages: vec![json!({"role":"user","content":"hi"})],
+            inserted_at: std::time::Instant::now(),
         }
     }
 
@@ -91,5 +147,42 @@ mod tests {
             .await
             .expect("update");
         assert!(store.delete("missing").await.expect("delete").is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_expired_entries() {
+        use std::time::Duration;
+
+        let store = ResponseStore::with_ttl(1); // 1 second TTL
+
+        // Insert a response with an old timestamp
+        let old = StoredResponse {
+            response: json!({"id":"old"}),
+            input_items: vec![],
+            request_messages: vec![],
+            inserted_at: Instant::now() - Duration::from_secs(10),
+        };
+        store.put("old".to_owned(), old).await.expect("put");
+
+        // Insert a fresh response
+        store
+            .put("fresh".to_owned(), stored_response("fresh"))
+            .await
+            .expect("put");
+
+        assert_eq!(store.inner.read().await.len(), 2);
+
+        // Run cleanup
+        store.start_cleanup_task();
+
+        // Wait for cleanup to run (interval is max(ttl, 10) = 10s for ttl=1, but we can test manually)
+        let mut guard = store.inner.write().await;
+        let ttl = *store.ttl_seconds;
+        guard.retain(|_, entry| entry.inserted_at.elapsed().as_secs() < ttl);
+        drop(guard);
+
+        assert_eq!(store.inner.read().await.len(), 1);
+        assert!(store.get("old").await.expect("get").is_none());
+        assert!(store.get("fresh").await.expect("get").is_some());
     }
 }

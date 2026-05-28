@@ -41,19 +41,36 @@ impl ToolExecutor {
     pub async fn execute_calls(
         &self,
         tool_calls: &[ToolCall],
+        parallel: bool,
     ) -> Result<Option<Vec<ToolOutput>>, ProxyError> {
         if tool_calls.is_empty() {
             return Ok(None);
         }
 
-        let mut outputs = Vec::new();
         for tool_call in tool_calls {
-            let Some(tool) = self.settings.local_tools.get(&tool_call.name) else {
+            if !self.settings.local_tools.contains_key(&tool_call.name) {
                 return Ok(None);
-            };
-            outputs.push(self.execute_call(tool_call, tool).await?);
+            }
         }
-        Ok(Some(outputs))
+
+        if parallel {
+            let futures: Vec<_> = tool_calls
+                .iter()
+                .map(|tool_call| {
+                    let tool = &self.settings.local_tools[&tool_call.name];
+                    self.execute_call(tool_call, tool)
+                })
+                .collect();
+            let results = futures_util::future::try_join_all(futures).await?;
+            Ok(Some(results))
+        } else {
+            let mut outputs = Vec::new();
+            for tool_call in tool_calls {
+                let tool = &self.settings.local_tools[&tool_call.name];
+                outputs.push(self.execute_call(tool_call, tool).await?);
+            }
+            Ok(Some(outputs))
+        }
     }
 
     async fn execute_call(

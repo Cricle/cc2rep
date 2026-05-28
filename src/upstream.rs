@@ -34,7 +34,7 @@ impl UpstreamClient {
     }
 
     pub async fn chat_json(&self, payload: &Value) -> Result<Value, ProxyError> {
-        let response = self.send(payload).await?;
+        let response = self.send_with_tool_choice_retry(payload).await?;
         response
             .json::<Value>()
             .await
@@ -42,7 +42,25 @@ impl UpstreamClient {
     }
 
     pub async fn chat_stream(&self, payload: &Value) -> Result<Response, ProxyError> {
-        self.send(payload).await
+        self.send_with_tool_choice_retry(payload).await
+    }
+
+    async fn send_with_tool_choice_retry(&self, payload: &Value) -> Result<Response, ProxyError> {
+        match self.send(payload).await {
+            Ok(response) => Ok(response),
+            Err(ProxyError::Upstream { status, message })
+                if status.as_u16() == 400
+                    && (message.contains("tool_choice") || message.contains("tool choice")) =>
+            {
+                warn!("tool_choice not supported, retrying without it");
+                let mut retry_payload = payload.clone();
+                if let Some(obj) = retry_payload.as_object_mut() {
+                    obj.remove("tool_choice");
+                }
+                self.send(&retry_payload).await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn send(&self, payload: &Value) -> Result<Response, ProxyError> {
@@ -143,9 +161,10 @@ mod tests {
             request_timeout_seconds: 0.1,
             strict_protocol: false,
             upstream_supports_image_input: false,
-            upstream_supports_reasoning_content: false,
-            upstream_supports_tool_choice_required: false,
-            upstream_supports_named_tool_choice: false,
+            upstream_supports_reasoning_content: None,
+            upstream_supports_tool_choice_required: None,
+            upstream_supports_named_tool_choice: None,
+            response_ttl_seconds: 3600,
             drop_input_reasoning: false,
             drop_tools: false,
             upstream_body: Default::default(),

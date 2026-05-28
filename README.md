@@ -2,13 +2,19 @@
 
 轻量 Rust 代理：对外暴露 OpenAI Responses 风格接口，对内转发到上游 `chat/completions`。
 
-发布说明：
+## 特性
 
-- CI 产出的 Linux release 二进制使用 `musl` 静态链接，便于直接分发运行。
+- **自动探测**：启动时自动探测上游 provider 能力（tool_choice、reasoning 等），无需手动配置
+- **本地工具执行**：支持配置本地命令作为工具，代理自动执行并回传结果
+- **并行工具调用**：多个工具调用可并行执行
+- **Reasoning 支持**：自动提取和转发 reasoning_content
+- **会话管理**：内存存储会话，定时清理过期条目
+- **多 provider 支持**：已测试 DeepSeek、MiMo 等
 
-## 运行
+## 快速开始
 
 ```bash
+# 最小配置只需 URL + API Key + Model
 cargo run -- --config ./config.example.json
 ```
 
@@ -18,62 +24,158 @@ Codex 或其他客户端将 `base_url` 指向这个服务，并使用 `proxy_api
 
 配置文件使用 JSON，示例见 [config.example.json](./config.example.json)。
 
-`upstream_body` 可用于给上游请求追加自定义 JSON 字段，例如一些 provider 专有参数。代理自身生成的字段如 `model`、`messages`、`stream`、`tools` 仍然优先覆盖同名键。
-
-稳定优先的通用能力开关：
-
-- `upstream_supports_image_input`: 上游支持 `image_url` / `input_image` 时再打开。
-- `upstream_supports_reasoning_content`: 上游要求工具续轮回传 `reasoning_content` 时打开，例如 DeepSeek thinking mode。
-- `upstream_supports_tool_choice_required`: 上游明确支持 `tool_choice: "required"` 时打开；默认会保守降级成 `auto`。
-- `upstream_supports_named_tool_choice`: 上游明确支持命名 `tool_choice` 对象时打开；默认会保守降级成 `auto`。
-- `drop_input_reasoning`: 丢弃客户端输入里的 `reasoning` 项，避免继续把思考链历史传给上游。
-- `drop_tools`: 丢弃客户端声明的 `tools`、`tool_choice` 以及输入里的 `function_call` / `function_call_output`，强制退化为纯文本对话。
-
-推荐策略：
-
-- 新接一个未知的 `chat/completions` provider 时，先保持所有 `upstream_supports_*` 为 `false`，优先确认基础文本对话稳定。
-- 确认 provider 支持对应能力后，再逐项打开 `image_input`、`reasoning_content`、命名 `tool_choice` 等高级特性。
-- DeepSeek 这类需要 thinking/tool roundtrip 的 provider，建议至少打开 `upstream_supports_reasoning_content`。
-
-DeepSeek 建议配置片段：
+### 最小配置
 
 ```json
 {
-  "upstream_model": "deepseek-chat",
-  "upstream_supports_reasoning_content": true,
-  "upstream_supports_tool_choice_required": false,
-  "upstream_supports_named_tool_choice": false,
-  "drop_input_reasoning": false,
-  "drop_tools": false
+  "proxy_host": "127.0.0.1",
+  "proxy_port": 8800,
+  "proxy_api_key": "your-proxy-key",
+  "upstream_base_url": "https://api.deepseek.com/v1",
+  "upstream_chat_path": "/chat/completions",
+  "upstream_model": "deepseek-v4-pro",
+  "upstream_api_key": "your-api-key",
+  "upstream_api_key_header_name": "Authorization",
+  "upstream_api_key_prefix": "Bearer "
 }
 ```
 
-当前版本支持：
+### 完整配置
 
-- `POST /v1/responses`
-- `GET /v1/responses/{id}`
-- `GET /v1/responses/{id}/input_items`
-- `POST /v1/responses/{id}/cancel`
-- `DELETE /v1/responses/{id}`
-- `GET /healthz`
-- 非流式和 SSE 流式输出
-- `previous_response_id` 历史回放
-- `function` tools、`function_call`、`function_call_output` 闭环
-- 可选的代理内本地工具自动执行
-- 多模态输入中的 `image_url` / `input_image` 转发
-- `strict_protocol` 和 `metadata.response_proxy.compatibility.ignored_fields`
+```json
+{
+  "proxy_host": "127.0.0.1",
+  "proxy_port": 8800,
+  "proxy_api_key": "your-proxy-key",
+  "upstream_base_url": "https://api.deepseek.com/v1",
+  "upstream_chat_path": "/chat/completions",
+  "upstream_model": "deepseek-v4-pro",
+  "upstream_api_key": "your-api-key",
+  "upstream_headers": {},
+  "upstream_body": {},
+  "upstream_api_key_header_name": "Authorization",
+  "upstream_api_key_prefix": "Bearer ",
+  "request_timeout_seconds": 120.0,
+  "upstream_supports_image_input": false,
+  "drop_input_reasoning": false,
+  "drop_tools": false,
+  "response_ttl_seconds": 3600,
+  "max_auto_tool_rounds": 8,
+  "local_tools": {
+    "get_weather": {
+      "command": "sh",
+      "args": ["-c", "read JSON; echo $JSON | jq -r '.arguments.city'"],
+      "stdin_json": true,
+      "output_json": true,
+      "timeout_seconds": 5.0
+    }
+  },
+  "model_aliases": {
+    "gpt-5-codex": "deepseek-v4-pro"
+  }
+}
+```
 
-说明：
+### 配置项说明
 
-- 响应对象和输入项仅保存在内存中，不落库。
-- 图片输入转发需要启用 `upstream_supports_image_input`。
-- 未配置 `local_tools` 时，工具执行仍由客户端按 `function_call` / `function_call_output` 往返完成。
-- 配置了 `local_tools` 后，非流式请求里命中的 `function` 工具会由代理自动执行，并自动把 `function_call_output` 回传给上游继续完成对话。
-- 配置了 `local_tools` 后，流式请求也会自动执行命中的本地工具；客户端看到的是自动续跑后的最终回答流，而不是中间的内部工具轮次。
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `proxy_host` | `127.0.0.1` | 监听地址 |
+| `proxy_port` | `8800` | 监听端口 |
+| `proxy_api_key` | 必填 | 代理 API Key |
+| `upstream_base_url` | 必填 | 上游 API 地址 |
+| `upstream_chat_path` | `/v1/chat/completions` | chat/completions 路径 |
+| `upstream_model` | 必填 | 上游模型名称 |
+| `upstream_api_key` | 必填 | 上游 API Key |
+| `request_timeout_seconds` | `120.0` | 请求超时（秒） |
+| `response_ttl_seconds` | `3600` | 会话过期时间（秒） |
+| `max_auto_tool_rounds` | `8` | 最大自动工具轮次 |
+| `upstream_supports_image_input` | `false` | 上游是否支持图片输入 |
+| `drop_input_reasoning` | `false` | 丢弃输入中的 reasoning |
+| `drop_tools` | `false` | 丢弃工具，强制纯文本 |
 
-`local_tools` 约定：
+### 自动探测
 
-- `command` / `args` 定义本地可执行命令。
-- 默认会把 `{"name","call_id","arguments"}` 作为 JSON 写入工具进程的 `stdin`。
-- 默认要求工具从 `stdout` 输出合法 JSON，代理会把这段 JSON 作为 `function_call_output.output` 继续发给上游。
-- 如果你的工具只输出纯文本，可以把 `output_json` 设为 `false`。
+启动时会自动探测以下能力，无需手动配置：
+
+- `upstream_supports_named_tool_choice` — 命名 tool_choice 支持
+- `upstream_supports_tool_choice_required` — `tool_choice: "required"` 支持
+- `upstream_supports_reasoning_content` — reasoning_content 支持
+
+探测失败时保守降级（默认 false），不影响启动。
+
+### tool_choice 兼容性
+
+代理会自动处理 tool_choice 不兼容的情况：
+
+- 命名 tool_choice 不支持 → 回退到 `"required"`
+- `"required"` 不支持 → 回退到 `"auto"`
+- 上游返回 tool_choice 错误 → 自动去掉 tool_choice 重试
+
+### 本地工具
+
+配置 `local_tools` 后，代理会自动执行匹配的工具调用：
+
+```json
+{
+  "local_tools": {
+    "tool_name": {
+      "command": "python3",
+      "args": ["-c", "import json,sys; d=json.load(sys.stdin); print(json.dumps({'result': eval(d['arguments']['expr'])}))"],
+      "stdin_json": true,
+      "output_json": true,
+      "timeout_seconds": 10.0
+    }
+  }
+}
+```
+
+- `stdin_json: true` — 通过 stdin 传入 `{"name", "call_id", "arguments"}`
+- `output_json: true` — 要求 stdout 输出合法 JSON
+- 多个工具调用会并行执行
+
+### 模型别名
+
+```json
+{
+  "model_aliases": {
+    "gpt-5-codex": "deepseek-v4-pro"
+  }
+}
+```
+
+客户端请求 `gpt-5-codex` 时，实际使用 `deepseek-v4-pro`。
+
+## 支持的 API
+
+- `POST /v1/responses` — 创建响应（流式/非流式）
+- `GET /v1/responses/{id}` — 获取响应
+- `GET /v1/responses/{id}/input_items` — 获取输入项
+- `POST /v1/responses/{id}/cancel` — 取消响应
+- `DELETE /v1/responses/{id}` — 删除响应
+- `GET /healthz` — 健康检查
+
+## 已测试 Provider
+
+| Provider | 模型 | 基础对话 | 流式 | Reasoning | Tool Calls |
+|----------|------|----------|------|-----------|------------|
+| DeepSeek | deepseek-v4-pro | ✓ | ✓ | ✓ | ✓ |
+| DeepSeek | deepseek-reasoner | ✓ | ✓ | ✓ | ✓ (自动重试) |
+| MiMo | mimo-v2.5-pro | ✓ | ✓ | ✓ | ✓ |
+
+## 构建
+
+```bash
+# 开发构建
+cargo build
+
+# 运行测试
+cargo test
+
+# 发布构建
+cargo build --release
+```
+
+## 许可证
+
+MIT

@@ -6,7 +6,7 @@ use std::{
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::{config::Settings, error::ProxyError, protocol::ProtocolReport};
+use crate::{config::Settings, error::ProxyError, probe::Capabilities, protocol::ProtocolReport};
 
 #[derive(Debug, Clone)]
 pub struct RequestContext {
@@ -24,6 +24,7 @@ pub struct RequestContext {
     pub tool_choice: Value,
     pub tools: Vec<Value>,
     pub max_output_tokens: Option<u64>,
+    pub max_tool_calls: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +54,7 @@ pub fn translate_request(
     settings: &Settings,
     report: &ProtocolReport,
     previous_messages: &[Value],
+    capabilities: &Capabilities,
 ) -> Result<TranslatedRequest, ProxyError> {
     validate_text_format(payload)?;
 
@@ -64,8 +66,10 @@ pub fn translate_request(
     let store = optional_bool(payload, "store")?.unwrap_or(true);
     let parallel_tool_calls = optional_bool(payload, "parallel_tool_calls")?.unwrap_or(true);
     let metadata = build_metadata(payload.get("metadata"), report)?;
-    let max_output_tokens = optional_u64(payload, "max_output_tokens")?;
-    let input_items = normalize_input_items(payload.get("input"), settings)?;
+    let max_output_tokens = optional_u64(payload, "max_output_tokens")?
+        .and_then(|v| if v == 0 { None } else { Some(v) });
+    let max_tool_calls = optional_u64(payload, "max_tool_calls")?.map(|v| v as u32);
+    let input_items = normalize_input_items(payload.get("input"), settings, capabilities)?;
     let tools = if settings.drop_tools {
         Vec::new()
     } else {
@@ -85,6 +89,7 @@ pub fn translate_request(
         &input_items,
         instructions.as_deref(),
         settings,
+        capabilities,
     )?;
     let mut upstream: Map<String, Value> = settings.upstream_body.clone().into_iter().collect();
     upstream.insert("model".to_owned(), Value::String(upstream_model.clone()));
@@ -106,11 +111,15 @@ pub fn translate_request(
     if let Some(max_tokens) = max_output_tokens {
         upstream.insert("max_tokens".to_owned(), json!(max_tokens));
     }
+    if let Some(top_logprobs) = optional_u64(payload, "top_logprobs")? {
+        upstream.insert("logprobs".to_owned(), Value::Bool(true));
+        upstream.insert("top_logprobs".to_owned(), json!(top_logprobs));
+    }
     if !tools.is_empty() {
         upstream.insert("tools".to_owned(), Value::Array(tools.clone()));
         upstream.insert(
             "tool_choice".to_owned(),
-            normalize_tool_choice(payload.get("tool_choice"), settings)?,
+            normalize_tool_choice(payload.get("tool_choice"), settings, capabilities)?,
         );
     }
 
@@ -129,6 +138,7 @@ pub fn translate_request(
         tool_choice,
         tools,
         max_output_tokens,
+        max_tool_calls,
         response_id,
     };
 
@@ -490,6 +500,7 @@ fn build_metadata(source: Option<&Value>, report: &ProtocolReport) -> Result<Val
 fn normalize_input_items(
     input: Option<&Value>,
     settings: &Settings,
+    capabilities: &Capabilities,
 ) -> Result<Vec<Value>, ProxyError> {
     let Some(input) = input else {
         return Err(ProxyError::bad_request("input is required"));
@@ -501,16 +512,20 @@ fn normalize_input_items(
         )]),
         Value::Array(items) => items
             .iter()
-            .map(|item| normalize_input_item(item, settings))
+            .map(|item| normalize_input_item(item, settings, capabilities))
             .collect(),
-        Value::Object(_) => Ok(vec![normalize_input_item(input, settings)?]),
+        Value::Object(_) => Ok(vec![normalize_input_item(input, settings, capabilities)?]),
         _ => Err(ProxyError::bad_request(
             "input must be a string, object, or array",
         )),
     }
 }
 
-fn normalize_input_item(item: &Value, settings: &Settings) -> Result<Value, ProxyError> {
+fn normalize_input_item(
+    item: &Value,
+    settings: &Settings,
+    capabilities: &Capabilities,
+) -> Result<Value, ProxyError> {
     let map = item
         .as_object()
         .ok_or_else(|| ProxyError::bad_request("input array entries must be objects"))?;
@@ -523,7 +538,7 @@ fn normalize_input_item(item: &Value, settings: &Settings) -> Result<Value, Prox
             let content = map
                 .get("content")
                 .ok_or_else(|| ProxyError::bad_request("input message is missing content"))?;
-            let normalized_content = normalize_content_parts(content, settings)?;
+            let normalized_content = normalize_content_parts(content, settings, capabilities)?;
             Ok(normalized_message(role, normalized_content))
         }
         Some("input_text") | Some("text") => {
@@ -592,7 +607,7 @@ fn normalize_input_item(item: &Value, settings: &Settings) -> Result<Value, Prox
             }))
         }
         Some("input_image") | Some("image_url") => {
-            if !settings.upstream_supports_image_input {
+            if !capabilities.supports_image_input {
                 return Err(ProxyError::bad_request(
                     "image input is disabled for this upstream; enable `upstream_supports_image_input` to forward image_url content",
                 ));
@@ -613,24 +628,36 @@ fn normalize_input_item(item: &Value, settings: &Settings) -> Result<Value, Prox
     }
 }
 
-fn normalize_content_parts(content: &Value, settings: &Settings) -> Result<Vec<Value>, ProxyError> {
+fn normalize_content_parts(
+    content: &Value,
+    settings: &Settings,
+    capabilities: &Capabilities,
+) -> Result<Vec<Value>, ProxyError> {
     match content {
         Value::String(text) => Ok(vec![normalized_text_part(text)]),
         Value::Array(parts) => {
             let mut normalized = Vec::new();
             for part in parts {
-                normalized.push(normalize_content_part(part, settings)?);
+                normalized.push(normalize_content_part(part, settings, capabilities)?);
             }
             Ok(normalized)
         }
-        Value::Object(_) => Ok(vec![normalize_content_part(content, settings)?]),
+        Value::Object(_) => Ok(vec![normalize_content_part(
+            content,
+            settings,
+            capabilities,
+        )?]),
         _ => Err(ProxyError::bad_request(
             "message content must be a string, object, or array",
         )),
     }
 }
 
-fn normalize_content_part(part: &Value, settings: &Settings) -> Result<Value, ProxyError> {
+fn normalize_content_part(
+    part: &Value,
+    _settings: &Settings,
+    capabilities: &Capabilities,
+) -> Result<Value, ProxyError> {
     if let Some(text) = part.as_str() {
         return Ok(normalized_text_part(text));
     }
@@ -650,7 +677,7 @@ fn normalize_content_part(part: &Value, settings: &Settings) -> Result<Value, Pr
             Ok(normalized_text_part(text))
         }
         "input_image" | "image_url" => {
-            if !settings.upstream_supports_image_input {
+            if !capabilities.supports_image_input {
                 return Err(ProxyError::bad_request(
                     "image input is disabled for this upstream; enable `upstream_supports_image_input` to forward image_url content",
                 ));
@@ -673,6 +700,7 @@ fn build_messages(
     input_items: &[Value],
     instructions: Option<&str>,
     settings: &Settings,
+    capabilities: &Capabilities,
 ) -> Result<Vec<Value>, ProxyError> {
     let mut messages = previous_messages.to_vec();
     if let Some(instructions) = instructions {
@@ -696,6 +724,7 @@ fn build_messages(
                     &mut pending_tool_calls,
                     &mut pending_reasoning,
                     settings,
+                    capabilities,
                 );
                 let role = map
                     .get("role")
@@ -755,6 +784,7 @@ fn build_messages(
                     &mut pending_tool_calls,
                     &mut pending_reasoning,
                     settings,
+                    capabilities,
                 );
                 messages.push(json!({
                     "role": "tool",
@@ -774,6 +804,7 @@ fn build_messages(
         &mut pending_tool_calls,
         &mut pending_reasoning,
         settings,
+        capabilities,
     );
 
     if messages.is_empty() {
@@ -823,7 +854,8 @@ fn flush_pending_tool_calls(
     messages: &mut Vec<Value>,
     pending_tool_calls: &mut Vec<Value>,
     pending_reasoning: &mut String,
-    settings: &Settings,
+    _settings: &Settings,
+    capabilities: &Capabilities,
 ) {
     if pending_tool_calls.is_empty() {
         pending_reasoning.clear();
@@ -834,7 +866,7 @@ fn flush_pending_tool_calls(
         "content": null,
         "tool_calls": Value::Array(std::mem::take(pending_tool_calls)),
     });
-    if settings.upstream_supports_reasoning_content && !pending_reasoning.is_empty() {
+    if capabilities.supports_reasoning_content && !pending_reasoning.is_empty() {
         assistant_message["reasoning_content"] = Value::String(std::mem::take(pending_reasoning));
     }
     messages.push(assistant_message);
@@ -919,7 +951,8 @@ fn convert_function_tool(map: &Map<String, Value>) -> Result<Value, ProxyError> 
 
 fn normalize_tool_choice(
     tool_choice: Option<&Value>,
-    settings: &Settings,
+    _settings: &Settings,
+    capabilities: &Capabilities,
 ) -> Result<Value, ProxyError> {
     let Some(value) = tool_choice else {
         return Ok(Value::String("auto".to_owned()));
@@ -928,7 +961,7 @@ fn normalize_tool_choice(
         Value::String(choice) => match choice.as_str() {
             "auto" | "none" => Ok(Value::String(choice.clone())),
             "required" => {
-                if settings.upstream_supports_tool_choice_required {
+                if capabilities.supports_tool_choice_required {
                     Ok(Value::String(choice.clone()))
                 } else {
                     Ok(Value::String("auto".to_owned()))
@@ -939,8 +972,13 @@ fn normalize_tool_choice(
             ))),
         },
         Value::Object(map) => {
-            if !settings.upstream_supports_named_tool_choice {
-                return Ok(Value::String("auto".to_owned()));
+            if !capabilities.supports_named_tool_choice {
+                // Fall back to "required" if supported, otherwise "auto"
+                return if capabilities.supports_tool_choice_required {
+                    Ok(Value::String("required".to_owned()))
+                } else {
+                    Ok(Value::String("auto".to_owned()))
+                };
             }
             let tool_type = map
                 .get("type")
@@ -1210,9 +1248,10 @@ mod tests {
             request_timeout_seconds: 30.0,
             strict_protocol: false,
             upstream_supports_image_input: image_input,
-            upstream_supports_reasoning_content: false,
-            upstream_supports_tool_choice_required: false,
-            upstream_supports_named_tool_choice: false,
+            upstream_supports_reasoning_content: None,
+            upstream_supports_tool_choice_required: None,
+            upstream_supports_named_tool_choice: None,
+            response_ttl_seconds: 3600,
             drop_input_reasoning: false,
             drop_tools: false,
             upstream_body: [("seed".to_owned(), json!(7))].into_iter().collect(),
@@ -1221,6 +1260,24 @@ mod tests {
                 .collect(),
             local_tools: Default::default(),
             max_auto_tool_rounds: 8,
+        }
+    }
+
+    fn caps(image_input: bool) -> Capabilities {
+        Capabilities {
+            supports_named_tool_choice: false,
+            supports_tool_choice_required: false,
+            supports_reasoning_content: false,
+            supports_image_input: image_input,
+        }
+    }
+
+    fn caps_full() -> Capabilities {
+        Capabilities {
+            supports_named_tool_choice: true,
+            supports_tool_choice_required: true,
+            supports_reasoning_content: true,
+            supports_image_input: true,
         }
     }
 
@@ -1240,14 +1297,15 @@ mod tests {
             tool_choice: json!("auto"),
             tools: vec![json!({"type":"function"})],
             max_output_tokens: Some(55),
+            max_tool_calls: None,
         }
     }
 
     #[test]
     fn translate_request_builds_upstream_payload_and_context() {
         let mut cfg = settings(false);
-        cfg.upstream_supports_named_tool_choice = true;
-        cfg.upstream_supports_reasoning_content = true;
+        cfg.upstream_supports_named_tool_choice = Some(true);
+        cfg.upstream_supports_reasoning_content = Some(true);
         let payload = json!({
             "model": "client-model",
             "instructions": "be helpful",
@@ -1286,7 +1344,8 @@ mod tests {
         let object = payload.as_object().expect("object");
         let report = analyze_protocol(object);
 
-        let translated = translate_request(object, &cfg, &report, &[]).expect("translate");
+        let translated =
+            translate_request(object, &cfg, &report, &[], &caps_full()).expect("translate");
         let upstream = translated.upstream_payload.as_object().expect("upstream");
         assert_eq!(upstream["model"], "aliased-model");
         assert_eq!(upstream["stream"], true);
@@ -1327,6 +1386,7 @@ mod tests {
             &settings(false),
             &report,
             &[json!({"role":"assistant","content":"previous"})],
+            &caps(false),
         )
         .expect("translate");
 
@@ -1506,7 +1566,7 @@ mod tests {
             let object = payload.as_object().expect("object");
             let report = analyze_protocol(object);
             assert!(
-                translate_request(object, &settings(false), &report, &[]).is_err(),
+                translate_request(object, &settings(false), &report, &[], &caps(false)).is_err(),
                 "payload should fail: {payload}"
             );
         }
@@ -1519,8 +1579,10 @@ mod tests {
         let object = payload.as_object().expect("object");
         let report = analyze_protocol(object);
         let mut named_settings = settings(false);
-        named_settings.upstream_supports_named_tool_choice = true;
-        assert!(translate_request(object, &named_settings, &report, &[]).is_err());
+        named_settings.upstream_supports_named_tool_choice = Some(true);
+        let mut named_caps = caps(false);
+        named_caps.supports_named_tool_choice = true;
+        assert!(translate_request(object, &named_settings, &report, &[], &named_caps).is_err());
 
         let payload = json!({
             "input":"hi",
@@ -1529,7 +1591,7 @@ mod tests {
         });
         let object = payload.as_object().expect("object");
         let report = analyze_protocol(object);
-        assert!(translate_request(object, &named_settings, &report, &[]).is_err());
+        assert!(translate_request(object, &named_settings, &report, &[], &named_caps).is_err());
     }
 
     #[test]
@@ -1546,8 +1608,8 @@ mod tests {
         });
         let object = payload.as_object().expect("object");
         let report = analyze_protocol(object);
-        let translated =
-            translate_request(object, &settings(true), &report, &[]).expect("translate");
+        let translated = translate_request(object, &settings(true), &report, &[], &caps(true))
+            .expect("translate");
         assert!(translated.request_messages[0]["content"].is_array());
         assert_eq!(
             translated.request_messages[0]["content"][1]["type"],
@@ -1575,8 +1637,8 @@ mod tests {
         });
         let object = payload.as_object().expect("object");
         let report = analyze_protocol(object);
-        let translated =
-            translate_request(object, &settings(false), &report, &[]).expect("translate");
+        let translated = translate_request(object, &settings(false), &report, &[], &caps(false))
+            .expect("translate");
         assert_eq!(translated.input_items[0]["type"], "reasoning");
         assert_eq!(translated.input_items[0]["text"], "thinking done");
         assert_eq!(translated.request_messages.len(), 1);
@@ -1605,8 +1667,10 @@ mod tests {
         let object = payload.as_object().expect("object");
         let report = analyze_protocol(object);
         let mut cfg = settings(false);
-        cfg.upstream_supports_reasoning_content = true;
-        let translated = translate_request(object, &cfg, &report, &[]).expect("translate");
+        cfg.upstream_supports_reasoning_content = Some(true);
+        let mut c = caps(false);
+        c.supports_reasoning_content = true;
+        let translated = translate_request(object, &cfg, &report, &[], &c).expect("translate");
         assert_eq!(translated.request_messages.len(), 2);
         assert_eq!(translated.request_messages[0]["role"], "assistant");
         assert_eq!(
@@ -1662,21 +1726,26 @@ mod tests {
         assert!(extract_message_text(&json!({"no_text":true})).is_err());
         assert!(extract_message_text(&json!(1)).is_err());
         assert_eq!(
-            normalize_input_items(None, &settings(false))
+            normalize_input_items(None, &settings(false), &caps(false))
                 .unwrap_err()
                 .to_string(),
             "input is required"
         );
-        assert!(normalize_input_items(Some(&json!(1)), &settings(false)).is_err());
+        assert!(normalize_input_items(Some(&json!(1)), &settings(false), &caps(false)).is_err());
         assert_eq!(
-            normalize_input_item(&json!({"role":"user","content":"x"}), &settings(false))
-                .expect("message")["type"],
+            normalize_input_item(
+                &json!({"role":"user","content":"x"}),
+                &settings(false),
+                &caps(false)
+            )
+            .expect("message")["type"],
             "message"
         );
         assert_eq!(
             normalize_input_item(
                 &json!({"type":"function_call_output","id":"call_1","content":{"ok":true}}),
-                &settings(false)
+                &settings(false),
+                &caps(false),
             )
             .expect("tool output")["output"],
             "{\"ok\":true}"
@@ -1684,19 +1753,25 @@ mod tests {
         assert!(
             normalize_input_item(
                 &json!({"type":"function_call_output","output":"x"}),
-                &settings(false)
+                &settings(false),
+                &caps(false),
             )
             .is_err()
         );
         assert_eq!(
-            normalize_input_item(&json!({"type":"text","text":"inline"}), &settings(false))
-                .expect("text item")["content"][0]["text"],
+            normalize_input_item(
+                &json!({"type":"text","text":"inline"}),
+                &settings(false),
+                &caps(false)
+            )
+            .expect("text item")["content"][0]["text"],
             "inline"
         );
         assert_eq!(
             normalize_input_item(
                 &json!({"type":"reasoning","summary":[{"text":"step "},"done"]}),
-                &settings(false)
+                &settings(false),
+                &caps(false),
             )
             .expect("reasoning item")["text"],
             "step done"
@@ -1704,30 +1779,40 @@ mod tests {
         assert_eq!(
             normalize_input_item(
                 &json!({"type":"image_url","url":"https://img"}),
-                &settings(true)
+                &settings(true),
+                &caps(true),
             )
             .expect("image")["content"][0]["image_url"]["url"],
             "https://img"
         );
 
         assert_eq!(
-            normalize_content_parts(&json!({"type":"text","text":"x"}), &settings(false))
-                .expect("object part")[0]["text"],
+            normalize_content_parts(
+                &json!({"type":"text","text":"x"}),
+                &settings(false),
+                &caps(false)
+            )
+            .expect("object part")[0]["text"],
             "x"
         );
         assert_eq!(
-            normalize_content_part(&json!("plain"), &settings(false)).expect("string part")["text"],
+            normalize_content_part(&json!("plain"), &settings(false), &caps(false))
+                .expect("string part")["text"],
             "plain"
         );
         assert_eq!(
             normalize_content_part(
                 &json!({"type":"image_url","url":"https://img"}),
-                &settings(true)
+                &settings(true),
+                &caps(true),
             )
             .expect("image part")["image_url"]["url"],
             "https://img"
         );
-        assert!(normalize_content_part(&json!({"type":"custom"}), &settings(false)).is_err());
+        assert!(
+            normalize_content_part(&json!({"type":"custom"}), &settings(false), &caps(false))
+                .is_err()
+        );
 
         let messages = build_messages(
             &[],
@@ -1737,10 +1822,20 @@ mod tests {
             ],
             None,
             &settings(false),
+            &caps(false),
         )
         .expect("messages");
         assert_eq!(messages[0]["role"], "assistant");
-        assert!(build_messages(&[], &[json!({"type":"custom"})], None, &settings(false)).is_err());
+        assert!(
+            build_messages(
+                &[],
+                &[json!({"type":"custom"})],
+                None,
+                &settings(false),
+                &caps(false)
+            )
+            .is_err()
+        );
 
         let mut drop_tools_settings = settings(false);
         drop_tools_settings.drop_tools = true;
@@ -1754,6 +1849,7 @@ mod tests {
             ],
             None,
             &drop_tools_settings,
+            &caps(false),
         )
         .expect("messages");
         assert_eq!(messages.len(), 1);
@@ -1771,19 +1867,21 @@ mod tests {
             &mut pending,
             &mut pending_reasoning,
             &settings(false),
+            &caps(false),
         );
         assert!(messages.is_empty());
 
         let mut messages = vec![];
         let mut pending = vec![json!({"id":"call_1"})];
         let mut pending_reasoning = "think".to_owned();
-        let mut reasoning_settings = settings(false);
-        reasoning_settings.upstream_supports_reasoning_content = true;
+        let mut reasoning_caps = caps(false);
+        reasoning_caps.supports_reasoning_content = true;
         flush_pending_tool_calls(
             &mut messages,
             &mut pending,
             &mut pending_reasoning,
-            &reasoning_settings,
+            &settings(false),
+            &reasoning_caps,
         );
         assert_eq!(messages[0]["reasoning_content"], "think");
 
@@ -1804,25 +1902,28 @@ mod tests {
         );
 
         assert_eq!(
-            normalize_tool_choice(None, &settings(false)).expect("none"),
+            normalize_tool_choice(None, &settings(false), &caps(false)).expect("none"),
             Value::String("auto".to_owned())
         );
         assert_eq!(
-            normalize_tool_choice(Some(&json!("required")), &settings(false)).expect("required"),
+            normalize_tool_choice(Some(&json!("required")), &settings(false), &caps(false))
+                .expect("required"),
             Value::String("auto".to_owned())
         );
-        let mut required_settings = settings(false);
-        required_settings.upstream_supports_tool_choice_required = true;
+        let mut required_caps = caps(false);
+        required_caps.supports_tool_choice_required = true;
         assert_eq!(
-            normalize_tool_choice(Some(&json!("required")), &required_settings).expect("required"),
+            normalize_tool_choice(Some(&json!("required")), &settings(false), &required_caps)
+                .expect("required"),
             Value::String("required".to_owned())
         );
-        let mut named_settings = settings(false);
-        named_settings.upstream_supports_named_tool_choice = true;
+        let mut named_caps = caps(false);
+        named_caps.supports_named_tool_choice = true;
         assert_eq!(
             normalize_tool_choice(
                 Some(&json!({"type":"function","name":"lookup"})),
-                &named_settings
+                &settings(false),
+                &named_caps,
             )
             .expect("object name")["function"]["name"],
             "lookup"
@@ -1830,21 +1931,25 @@ mod tests {
         assert_eq!(
             normalize_tool_choice(
                 Some(&json!({"type":"function","name":"lookup"})),
-                &settings(false)
+                &settings(false),
+                &caps(false),
             )
             .expect("fallback"),
             Value::String("auto".to_owned())
         );
-        assert!(normalize_tool_choice(Some(&json!("weird")), &settings(false)).is_err());
+        assert!(
+            normalize_tool_choice(Some(&json!("weird")), &settings(false), &caps(false)).is_err()
+        );
         assert_eq!(
             normalize_tool_choice(
                 Some(&json!({"type":"function","function":{"name":"lookup"}})),
-                &named_settings
+                &settings(false),
+                &named_caps,
             )
             .expect("object")["function"]["name"],
             "lookup"
         );
-        assert!(normalize_tool_choice(Some(&json!(1)), &settings(false)).is_err());
+        assert!(normalize_tool_choice(Some(&json!(1)), &settings(false), &caps(false)).is_err());
 
         assert!(parse_tool_calls(None).expect("none").is_empty());
         let generated = parse_tool_calls(Some(&json!([{

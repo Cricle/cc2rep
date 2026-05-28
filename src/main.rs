@@ -4,7 +4,7 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use cc2rep::{Settings, build_router};
+use cc2rep::{Settings, build_router, probe_upstream};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -30,7 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         upstream_model = %settings.upstream_model,
         "proxy configured"
     );
-    let router = build_router(settings);
+    let capabilities = probe_upstream(&settings).await;
+    let router = build_router(settings, capabilities);
     let listener = TcpListener::bind(addr).await?;
 
     info!("listening on http://{}", addr);

@@ -33,11 +33,13 @@ pub struct Settings {
     #[serde(default)]
     pub upstream_supports_image_input: bool,
     #[serde(default)]
-    pub upstream_supports_reasoning_content: bool,
+    pub upstream_supports_reasoning_content: Option<bool>,
     #[serde(default)]
-    pub upstream_supports_tool_choice_required: bool,
+    pub upstream_supports_tool_choice_required: Option<bool>,
     #[serde(default)]
-    pub upstream_supports_named_tool_choice: bool,
+    pub upstream_supports_named_tool_choice: Option<bool>,
+    #[serde(default = "default_response_ttl_seconds")]
+    pub response_ttl_seconds: u64,
     #[serde(default)]
     pub drop_input_reasoning: bool,
     #[serde(default)]
@@ -91,6 +93,10 @@ fn default_tool_timeout_seconds() -> f64 {
 
 fn default_max_auto_tool_rounds() -> u32 {
     8
+}
+
+fn default_response_ttl_seconds() -> u64 {
+    3600
 }
 
 fn default_true() -> bool {
@@ -212,9 +218,10 @@ mod tests {
             request_timeout_seconds: 30.0,
             strict_protocol: false,
             upstream_supports_image_input: false,
-            upstream_supports_reasoning_content: false,
-            upstream_supports_tool_choice_required: false,
-            upstream_supports_named_tool_choice: false,
+            upstream_supports_reasoning_content: None,
+            upstream_supports_tool_choice_required: None,
+            upstream_supports_named_tool_choice: None,
+            response_ttl_seconds: 3600,
             drop_input_reasoning: false,
             drop_tools: false,
             upstream_body: [("seed".to_owned(), json!(1))].into_iter().collect(),

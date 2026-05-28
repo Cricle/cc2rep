@@ -19,11 +19,10 @@ const SUPPORTED_FIELDS: &[&str] = &[
     "user",
 ];
 
-const EMULATED_FIELDS: &[&str] = &["parallel_tool_calls", "store"];
+const EMULATED_FIELDS: &[&str] = &["max_tool_calls", "parallel_tool_calls", "store"];
 const IGNORED_FIELDS: &[&str] = &[
     "background",
     "include",
-    "max_tool_calls",
     "previous_response_id",
     "prompt",
     "prompt_cache_key",
