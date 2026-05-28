@@ -44,6 +44,7 @@ pub(crate) struct AppState {
     pub settings: Arc<Settings>,
     pub capabilities: Capabilities,
     pub upstream: UpstreamClient,
+    pub http_client: reqwest::Client,
     pub tool_executor: ToolExecutor,
     pub store: ResponseStore,
     pub inflight: InflightRegistry,
@@ -87,12 +88,14 @@ pub fn build_router(settings: Settings, capabilities: Capabilities) -> Router {
     let upstream = UpstreamClient::new(settings.clone()).expect("invalid settings");
     let store = ResponseStore::with_ttl(settings.response_ttl_seconds);
     store.start_cleanup_task();
+    let http_client = reqwest::Client::new();
     let state = AppState {
         tool_executor: ToolExecutor::new(settings.clone()),
         store,
         capabilities,
         settings,
         upstream,
+        http_client,
         inflight: InflightRegistry::default(),
     };
 
@@ -250,6 +253,19 @@ pub(crate) fn stream_response(
             "response": build_in_progress_response(&context),
         })));
 
+        for (hosted_index, hosted_item) in context.hosted_output_items.iter().enumerate() {
+            yield Ok::<Event, Infallible>(json_event("response.output_item.added", &mut sequence_number, json!({
+                "type": "response.output_item.added",
+                "output_index": hosted_index,
+                "item": hosted_item,
+            })));
+            yield Ok::<Event, Infallible>(json_event("response.output_item.done", &mut sequence_number, json!({
+                "type": "response.output_item.done",
+                "output_index": hosted_index,
+                "item": hosted_item,
+            })));
+        }
+
         let mut parser = SseParser::default();
         let mut stream = response.bytes_stream();
         let mut failed_message: Option<String> = None;
@@ -391,6 +407,19 @@ pub(crate) fn stream_response_with_auto_tools(
             "type": "response.created",
             "response": build_in_progress_response(&context),
         })));
+
+        for (hosted_index, hosted_item) in context.hosted_output_items.iter().enumerate() {
+            yield Ok::<Event, Infallible>(json_event("response.output_item.added", &mut sequence_number, json!({
+                "type": "response.output_item.added",
+                "output_index": hosted_index,
+                "item": hosted_item,
+            })));
+            yield Ok::<Event, Infallible>(json_event("response.output_item.done", &mut sequence_number, json!({
+                "type": "response.output_item.done",
+                "output_index": hosted_index,
+                "item": hosted_item,
+            })));
+        }
 
         let mut current_response = response;
         let mut current_payload = translated.upstream_payload.clone();
@@ -713,6 +742,7 @@ pub(crate) fn context_from_response(response: &Value) -> Result<RequestContext, 
             .get("max_tool_calls")
             .and_then(Value::as_u64)
             .map(|v| v as u32),
+        hosted_output_items: Vec::new(),
     })
 }
 
@@ -764,6 +794,10 @@ mod tests {
             max_auto_tool_rounds: 8,
             upstream_max_retries: 0,
             upstream_retry_base_delay_ms: 0,
+            web_search_url: None,
+            web_search_max_results: 5,
+            file_search_paths: Vec::new(),
+            file_search_max_results: 5,
         }
     }
 
@@ -1676,6 +1710,7 @@ mod tests {
             tools: vec![],
             max_output_tokens: None,
             max_tool_calls: None,
+            hosted_output_items: Vec::new(),
         };
         let events = finalize_stream_items(&turn, &context, &mut 0);
         assert_eq!(events.len(), 7);
@@ -1879,6 +1914,7 @@ mod tests {
                 false,
             )))
             .expect("client"),
+            http_client: reqwest::Client::new(),
             tool_executor: ToolExecutor::new(Arc::new(settings(
                 "http://127.0.0.1:1".to_owned(),
                 false,
@@ -2015,6 +2051,7 @@ mod tests {
             tools: vec![],
             max_output_tokens: None,
             max_tool_calls: None,
+            hosted_output_items: Vec::new(),
         };
         let events = apply_stream_delta(
             &mut state,

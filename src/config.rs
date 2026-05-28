@@ -56,6 +56,14 @@ pub struct Settings {
     pub upstream_max_retries: u32,
     #[serde(default = "default_upstream_retry_base_delay_ms")]
     pub upstream_retry_base_delay_ms: u64,
+    #[serde(default)]
+    pub web_search_url: Option<String>,
+    #[serde(default = "default_web_search_max_results")]
+    pub web_search_max_results: usize,
+    #[serde(default)]
+    pub file_search_paths: Vec<String>,
+    #[serde(default = "default_file_search_max_results")]
+    pub file_search_max_results: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,6 +117,14 @@ fn default_upstream_retry_base_delay_ms() -> u64 {
 
 fn default_response_ttl_seconds() -> u64 {
     3600
+}
+
+fn default_web_search_max_results() -> usize {
+    5
+}
+
+fn default_file_search_max_results() -> usize {
+    5
 }
 
 fn default_true() -> bool {
@@ -244,6 +260,10 @@ mod tests {
             max_auto_tool_rounds: 8,
             upstream_max_retries: 3,
             upstream_retry_base_delay_ms: 1000,
+            web_search_url: None,
+            web_search_max_results: 5,
+            file_search_paths: Vec::new(),
+            file_search_max_results: 5,
         }
     }
 

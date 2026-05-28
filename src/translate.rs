@@ -37,6 +37,7 @@ pub struct RequestContext {
     pub tools: Vec<Value>,
     pub max_output_tokens: Option<u64>,
     pub max_tool_calls: Option<u32>,
+    pub hosted_output_items: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +153,7 @@ pub fn translate_request(
         max_output_tokens,
         max_tool_calls,
         response_id,
+        hosted_output_items: Vec::new(),
     };
 
     upstream.insert("messages".to_owned(), Value::Array(messages));
@@ -294,6 +296,11 @@ pub fn message_output_offset(turn: &AssistantTurn) -> usize {
         } else {
             0
         }
+}
+
+/// Total number of output items before the assistant turn (hosted + reasoning + message).
+pub fn pre_turn_output_count(turn: &AssistantTurn, hosted_count: usize) -> usize {
+    hosted_count + message_output_offset(turn)
 }
 
 fn build_metadata(source: Option<&Value>, report: &ProtocolReport) -> Result<Value, ProxyError> {

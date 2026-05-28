@@ -169,6 +169,7 @@ fn build_response_with_status(
 
 fn build_output_items(context: &RequestContext, turn: &AssistantTurn, status: &str) -> Vec<Value> {
     let mut output = Vec::new();
+    output.extend(context.hosted_output_items.iter().cloned());
     if !turn.reasoning.is_empty() {
         output.push(build_reasoning_item(context, status, &turn.reasoning));
     }

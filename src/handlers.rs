@@ -38,13 +38,35 @@ pub(crate) async fn create_response(
         return Err(ProxyError::bad_request(message));
     }
     let previous_messages = crate::app::load_previous_messages(&state.store, map).await?;
-    let translated = translate_request(
+
+    let hosted_ctx =
+        crate::hosted::execute_hosted_tools(map, &state.settings, &state.http_client).await?;
+
+    let mut translated = translate_request(
         map,
         &state.settings,
         &report,
         &previous_messages,
         &state.capabilities,
     )?;
+
+    if !hosted_ctx.messages.is_empty()
+        && let Some(Value::Array(messages)) = translated.upstream_payload.get_mut("messages")
+    {
+        let insert_at = messages
+            .iter()
+            .position(|m| {
+                m.get("role")
+                    .and_then(Value::as_str)
+                    .map(|r| r != "system" && r != "developer")
+                    .unwrap_or(true)
+            })
+            .unwrap_or(messages.len());
+        for (i, msg) in hosted_ctx.messages.into_iter().enumerate() {
+            messages.insert(insert_at + i, msg);
+        }
+    }
+    translated.context.hosted_output_items = hosted_ctx.output_items;
 
     if translated.context.store {
         state

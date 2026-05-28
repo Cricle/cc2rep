@@ -110,6 +110,7 @@ pub(crate) fn stream_round_context() -> RequestContext {
         tools: Vec::new(),
         max_output_tokens: None,
         max_tool_calls: None,
+        hosted_output_items: Vec::new(),
     }
 }
 
@@ -130,13 +131,14 @@ pub(crate) fn finalize_stream_items(
     sequence_number: &mut u64,
 ) -> Vec<Event> {
     let mut events = Vec::new();
+    let hosted_count = context.hosted_output_items.len();
     if !assistant_turn.reasoning.is_empty() {
         events.push(json_event(
             "response.reasoning_summary_text.done",
             sequence_number,
             json!({
                 "type": "response.reasoning_summary_text.done",
-                "output_index": 0,
+                "output_index": hosted_count,
                 "item_id": context.reasoning_id,
                 "text": assistant_turn.reasoning,
             }),
@@ -146,14 +148,14 @@ pub(crate) fn finalize_stream_items(
             sequence_number,
             json!({
                 "type": "response.output_item.done",
-                "output_index": 0,
+                "output_index": hosted_count,
                 "item": build_reasoning_item(context, "completed", &assistant_turn.reasoning),
             }),
         ));
     }
 
     if !assistant_turn.text.is_empty() || assistant_turn.tool_calls.is_empty() {
-        let message_index = reasoning_output_offset(assistant_turn);
+        let message_index = hosted_count + reasoning_output_offset(assistant_turn);
         events.push(json_event(
             "response.output_text.done",
             sequence_number,
@@ -189,7 +191,7 @@ pub(crate) fn finalize_stream_items(
     }
 
     for (tool_index, tool_call) in assistant_turn.tool_calls.iter().enumerate() {
-        let output_index = message_output_offset(assistant_turn) + tool_index;
+        let output_index = hosted_count + message_output_offset(assistant_turn) + tool_index;
         events.push(json_event(
             "response.function_call_arguments.done",
             sequence_number,
@@ -232,6 +234,8 @@ pub(crate) fn apply_stream_delta(
         return Ok(events);
     };
 
+    let hosted_count = context.hosted_output_items.len();
+
     if let Some(reasoning_delta) = extract_first_reasoning(delta)
         && !reasoning_delta.is_empty()
     {
@@ -242,7 +246,7 @@ pub(crate) fn apply_stream_delta(
                 sequence_number,
                 json!({
                     "type": "response.output_item.added",
-                    "output_index": 0,
+                    "output_index": hosted_count,
                     "item": build_reasoning_item(context, "in_progress", ""),
                 }),
             ));
@@ -253,7 +257,7 @@ pub(crate) fn apply_stream_delta(
             sequence_number,
             json!({
                 "type": "response.reasoning_summary_text.delta",
-                "output_index": 0,
+                "output_index": hosted_count,
                 "item_id": context.reasoning_id,
                 "delta": reasoning_delta,
             }),
@@ -273,7 +277,7 @@ pub(crate) fn apply_stream_delta(
         if !delta_text.is_empty() {
             if !state.message_started {
                 state.message_started = true;
-                let output_index = if state.has_reasoning() { 1 } else { 0 };
+                let output_index = hosted_count + if state.has_reasoning() { 1 } else { 0 };
                 events.push(json_event(
                     "response.output_item.added",
                     sequence_number,
@@ -296,7 +300,7 @@ pub(crate) fn apply_stream_delta(
                 ));
             }
             state.text.push_str(&delta_text);
-            let output_index = if state.has_reasoning() { 1 } else { 0 };
+            let output_index = hosted_count + if state.has_reasoning() { 1 } else { 0 };
             events.push(json_event(
                 "response.output_text.delta",
                 sequence_number,
@@ -337,7 +341,7 @@ pub(crate) fn apply_stream_delta(
 
             if !was_added && !call_id.is_empty() && !name.is_empty() {
                 entry.added = true;
-                let output_index = message_output_offset(&state.to_turn()) + index;
+                let output_index = hosted_count + message_output_offset(&state.to_turn()) + index;
                 events.push(json_event(
                     "response.output_item.added",
                     sequence_number,
@@ -365,7 +369,7 @@ pub(crate) fn apply_stream_delta(
                     }),
                 ));
             } else if was_added {
-                let output_index = message_output_offset(&state.to_turn()) + index;
+                let output_index = hosted_count + message_output_offset(&state.to_turn()) + index;
                 if let Some(args) = tc_delta
                     .get("function")
                     .and_then(|f| f.get("arguments"))
