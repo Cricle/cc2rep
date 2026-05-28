@@ -4,9 +4,7 @@ use axum::{body::Body, http::Request};
 use http::StatusCode;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use tower::ServiceExt;
-
-use common::{PROXY_KEY, send, shared_router};
+use common::{send, shared_router};
 
 #[tokio::test]
 async fn healthz_returns_ok() {

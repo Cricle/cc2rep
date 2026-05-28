@@ -3,8 +3,7 @@ mod common;
 use serde_json::{Value, json};
 
 use common::{
-    MIMO_MODEL, calculator_tool, last_message_text, send_json, send_stream, shared_router,
-    weather_tool,
+    MIMO_MODEL, calculator_tool, send_json, send_stream, shared_router, weather_tool,
 };
 
 #[tokio::test]

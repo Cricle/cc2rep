@@ -4,8 +4,6 @@ use axum::{body::Body, http::Request};
 use http::StatusCode;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use tower::ServiceExt;
-
 use common::{MIMO_MODEL, PROXY_KEY, send, send_json, send_json_expect_error, shared_router};
 
 #[tokio::test]
