@@ -34,7 +34,7 @@ use crate::{
     tools::{ToolExecutor, append_tool_outputs},
     translate::{
         AssistantTurn, RequestContext, ToolCall, build_cancelled_response, build_failed_response,
-        build_history_message, build_in_progress_response, build_response,
+        build_history_message, build_in_progress_response, build_response, merge_usage,
         parse_assistant_turn_from_response, unix_timestamp, usage_from_upstream,
     },
     upstream::UpstreamClient,
@@ -132,11 +132,12 @@ pub(crate) async fn execute_non_stream_turn(
     let mut upstream_payload = translated.upstream_payload.clone();
     let mut last_upstream = state.upstream.chat_json(&upstream_payload).await?;
     let mut turn = parse_assistant_turn_from_response(&last_upstream)?;
+    let mut total_usage = usage_from_upstream(last_upstream.get("usage"));
 
     if !state.tool_executor.has_local_tools() {
         return Ok(NonStreamExecution {
             turn,
-            usage: usage_from_upstream(last_upstream.get("usage")),
+            usage: total_usage,
             request_messages: translated.request_messages.clone(),
         });
     }
@@ -170,31 +171,24 @@ pub(crate) async fn execute_non_stream_turn(
         };
         {
             let Some(payload_map) = upstream_payload.as_object_mut() else {
-                return Ok(NonStreamExecution {
-                    turn,
-                    usage: usage_from_upstream(last_upstream.get("usage")),
-                    request_messages: translated.request_messages.clone(),
-                });
+                break;
             };
             let Some(messages) = payload_map
                 .get_mut("messages")
                 .and_then(Value::as_array_mut)
             else {
-                return Ok(NonStreamExecution {
-                    turn,
-                    usage: usage_from_upstream(last_upstream.get("usage")),
-                    request_messages: translated.request_messages.clone(),
-                });
+                break;
             };
             append_tool_outputs(messages, &supported, &outputs, Some(&turn.reasoning));
         }
 
         last_upstream = state.upstream.chat_json(&upstream_payload).await?;
+        merge_usage(&mut total_usage, &usage_from_upstream(last_upstream.get("usage")));
         let next_turn = parse_assistant_turn_from_response(&last_upstream)?;
         if next_turn.tool_calls.is_empty() {
             return Ok(NonStreamExecution {
                 turn: next_turn,
-                usage: usage_from_upstream(last_upstream.get("usage")),
+                usage: total_usage,
                 request_messages: extract_request_messages(&upstream_payload),
             });
         }
@@ -203,7 +197,7 @@ pub(crate) async fn execute_non_stream_turn(
 
     Ok(NonStreamExecution {
         turn,
-        usage: usage_from_upstream(last_upstream.get("usage")),
+        usage: total_usage,
         request_messages: extract_request_messages(&upstream_payload),
     })
 }
@@ -437,7 +431,7 @@ pub(crate) fn stream_response_with_auto_tools(
         let mut current_response = response;
         let mut current_payload = translated.upstream_payload.clone();
         let mut final_turn = AssistantTurn::default();
-        let mut final_usage = usage_from_upstream(None);
+        let mut total_usage = usage_from_upstream(None);
         let mut failed_message: Option<String> = None;
         let mut cancelled = false;
         let max_tool_calls = context.max_tool_calls;
@@ -455,6 +449,7 @@ pub(crate) fn stream_response_with_auto_tools(
                     break;
                 }
                 Ok(StreamRoundOutcome::Completed { turn, usage }) => {
+                    merge_usage(&mut total_usage, &usage);
                     let supported: Vec<_> = turn
                         .tool_calls
                         .iter()
@@ -463,14 +458,12 @@ pub(crate) fn stream_response_with_auto_tools(
                         .collect();
                     if supported.is_empty() {
                         final_turn = turn;
-                        final_usage = usage;
                         break;
                     }
                     if let Some(limit) = max_tool_calls {
                         total_tool_calls += supported.len() as u32;
                         if total_tool_calls > limit {
                             final_turn = turn;
-                            final_usage = usage;
                             break;
                         }
                     }
@@ -479,7 +472,6 @@ pub(crate) fn stream_response_with_auto_tools(
                         Ok(Some(outputs)) => outputs,
                         Ok(None) => {
                             final_turn = turn;
-                            final_usage = usage;
                             break;
                         }
                         Err(err) => {
@@ -490,12 +482,10 @@ pub(crate) fn stream_response_with_auto_tools(
                     {
                         let Some(payload_map) = current_payload.as_object_mut() else {
                             final_turn = turn;
-                            final_usage = usage;
                             break;
                         };
                         let Some(messages) = payload_map.get_mut("messages").and_then(Value::as_array_mut) else {
                             final_turn = turn;
-                            final_usage = usage;
                             break;
                         };
                         append_tool_outputs(
@@ -533,7 +523,7 @@ pub(crate) fn stream_response_with_auto_tools(
             let cancelled_response = build_cancelled_response(
                 &context,
                 &final_turn,
-                final_usage.clone(),
+                total_usage.clone(),
                 unix_timestamp(),
             );
             let translated = translated_with_request_messages(&translated, extract_request_messages(&current_payload));
@@ -576,7 +566,7 @@ pub(crate) fn stream_response_with_auto_tools(
         let final_response = build_response(
             &context,
             &final_turn,
-            final_usage,
+            total_usage,
             unix_timestamp(),
         );
         metrics.record_completion(final_response.get("usage").unwrap_or(&json!({})));

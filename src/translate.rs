@@ -212,6 +212,48 @@ pub fn usage_from_upstream(usage: Option<&Value>) -> Value {
     })
 }
 
+/// Accumulate usage from an additional round into an existing total.
+pub fn merge_usage(total: &mut Value, round: &Value) {
+    let input = round
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = round
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached = round
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning = round
+        .get("output_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    if let Some(t) = total.get_mut("input_tokens") {
+        *t = json!(t.as_u64().unwrap_or(0) + input);
+    }
+    if let Some(t) = total.get_mut("output_tokens") {
+        *t = json!(t.as_u64().unwrap_or(0) + output);
+    }
+    if let Some(t) = total.get_mut("total_tokens") {
+        *t = json!(t.as_u64().unwrap_or(0) + input + output);
+    }
+    if let Some(details) = total.get_mut("input_tokens_details")
+        && let Some(t) = details.get_mut("cached_tokens")
+    {
+        *t = json!(t.as_u64().unwrap_or(0) + cached);
+    }
+    if let Some(details) = total.get_mut("output_tokens_details")
+        && let Some(t) = details.get_mut("reasoning_tokens")
+    {
+        *t = json!(t.as_u64().unwrap_or(0) + reasoning);
+    }
+}
+
 pub fn parse_assistant_turn_from_response(upstream: &Value) -> Result<AssistantTurn, ProxyError> {
     let choice = upstream
         .get("choices")
@@ -591,5 +633,40 @@ mod tests {
         });
         let usage = usage_from_upstream(Some(&upstream));
         assert_eq!(usage["total_tokens"], 150);
+    }
+
+    #[test]
+    fn merge_usage_accumulates_all_fields() {
+        let mut total = usage_from_upstream(Some(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "total_tokens": 150,
+            "prompt_tokens_details": { "cached_tokens": 80 },
+            "completion_tokens_details": { "reasoning_tokens": 10 },
+        })));
+        let round2 = usage_from_upstream(Some(&json!({
+            "prompt_tokens": 200,
+            "completion_tokens": 100,
+            "total_tokens": 300,
+            "prompt_tokens_details": { "cached_tokens": 150 },
+            "completion_tokens_details": { "reasoning_tokens": 30 },
+        })));
+        merge_usage(&mut total, &round2);
+        assert_eq!(total["input_tokens"], 300);
+        assert_eq!(total["output_tokens"], 150);
+        assert_eq!(total["total_tokens"], 450);
+        assert_eq!(total["input_tokens_details"]["cached_tokens"], 230);
+        assert_eq!(total["output_tokens_details"]["reasoning_tokens"], 40);
+    }
+
+    #[test]
+    fn merge_usage_with_zero_round() {
+        let mut total = usage_from_upstream(Some(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+        })));
+        merge_usage(&mut total, &usage_from_upstream(None));
+        assert_eq!(total["input_tokens"], 100);
+        assert_eq!(total["output_tokens"], 50);
     }
 }
