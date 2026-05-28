@@ -11,7 +11,10 @@ use cc2rep::{build_router, probe::probe_upstream, Settings};
 const PROXY_KEY: &str = "test-proxy-key";
 const MIMO_BASE_URL: &str = "https://token-plan-cn.xiaomimimo.com/v1";
 const MIMO_MODEL: &str = "mimo-v2.5-pro";
-const MIMO_API_KEY: &str = "tp-cthrf75v9g1g62f82upzd557d2za14xhwjoanh2qhvsa7k6d";
+
+fn mimo_api_key() -> String {
+    std::env::var("MIMO_API_KEY").expect("MIMO_API_KEY env var must be set to run e2e tests")
+}
 
 /// Rate limiter: ensures minimum delay between API calls.
 /// MiMo free tier has strict rate limits.
@@ -41,7 +44,7 @@ fn mimo_settings() -> Settings {
         upstream_base_url: MIMO_BASE_URL.to_owned(),
         upstream_chat_path: "/chat/completions".to_owned(),
         upstream_model: MIMO_MODEL.to_owned(),
-        upstream_api_key: MIMO_API_KEY.to_owned(),
+        upstream_api_key: mimo_api_key(),
         upstream_headers: Default::default(),
         upstream_api_key_header_name: "Authorization".to_owned(),
         upstream_api_key_prefix: "Bearer ".to_owned(),
