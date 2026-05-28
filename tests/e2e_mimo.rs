@@ -12,8 +12,18 @@ const PROXY_KEY: &str = "test-proxy-key";
 const MIMO_BASE_URL: &str = "https://token-plan-cn.xiaomimimo.com/v1";
 const MIMO_MODEL: &str = "mimo-v2.5-pro";
 
-fn mimo_api_key() -> String {
-    std::env::var("MIMO_API_KEY").expect("MIMO_API_KEY env var must be set to run e2e tests")
+fn mimo_api_key() -> Option<String> {
+    std::env::var("MIMO_API_KEY").ok()
+}
+
+/// Skip the test if MIMO_API_KEY is not set.
+macro_rules! require_api_key {
+    () => {
+        let Some(_) = mimo_api_key() else {
+            eprintln!("skipping: MIMO_API_KEY not set");
+            return;
+        };
+    };
 }
 
 /// Rate limiter: ensures minimum delay between API calls.
@@ -36,15 +46,15 @@ fn responses_request(body: &Value) -> Request<Body> {
         .expect("request")
 }
 
-fn mimo_settings() -> Settings {
-    Settings {
+fn mimo_settings() -> Option<Settings> {
+    Some(Settings {
         proxy_host: "127.0.0.1".to_owned(),
         proxy_port: 8800,
         proxy_api_key: PROXY_KEY.to_owned(),
         upstream_base_url: MIMO_BASE_URL.to_owned(),
         upstream_chat_path: "/chat/completions".to_owned(),
         upstream_model: MIMO_MODEL.to_owned(),
-        upstream_api_key: mimo_api_key(),
+        upstream_api_key: mimo_api_key()?,
         upstream_headers: Default::default(),
         upstream_api_key_header_name: "Authorization".to_owned(),
         upstream_api_key_prefix: "Bearer ".to_owned(),
@@ -63,7 +73,7 @@ fn mimo_settings() -> Settings {
         max_auto_tool_rounds: 8,
         upstream_max_retries: 3,
         upstream_retry_base_delay_ms: 1000,
-    }
+    })
 }
 
 fn weather_tool() -> Value {
@@ -97,17 +107,18 @@ fn calculator_tool() -> Value {
 }
 
 /// Shared router: probe once, reuse for all tests.
-static SHARED_ROUTER: LazyLock<tokio::sync::OnceCell<Router>> =
+static SHARED_ROUTER: LazyLock<tokio::sync::OnceCell<Option<Router>>> =
     LazyLock::new(tokio::sync::OnceCell::new);
 
-async fn shared_router() -> &'static Router {
+async fn shared_router() -> Option<&'static Router> {
     SHARED_ROUTER
         .get_or_init(|| async {
-            let settings = mimo_settings();
+            let settings = mimo_settings()?;
             let caps = probe_upstream(&settings).await;
-            build_router(settings, caps)
+            Some(build_router(settings, caps))
         })
         .await
+        .as_ref()
 }
 
 async fn send(router: &Router, request: Request<Body>) -> axum::response::Response {
@@ -179,7 +190,8 @@ fn last_message_text(body: &Value) -> &str {
 
 #[tokio::test]
 async fn healthz_returns_ok() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let response = send(
         router,
         Request::builder()
@@ -205,7 +217,8 @@ async fn healthz_returns_ok() {
 
 #[tokio::test]
 async fn missing_auth_returns_401() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let response = send(
         router,
         Request::builder()
@@ -221,7 +234,8 @@ async fn missing_auth_returns_401() {
 
 #[tokio::test]
 async fn wrong_auth_returns_401() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let response = send(
         router,
         Request::builder()
@@ -242,7 +256,8 @@ async fn wrong_auth_returns_401() {
 
 #[tokio::test]
 async fn non_stream_basic_completion() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -278,7 +293,8 @@ async fn non_stream_basic_completion() {
 
 #[tokio::test]
 async fn stream_basic_completion() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let events = send_stream(
         router,
         json!({
@@ -319,7 +335,8 @@ async fn stream_basic_completion() {
 
 #[tokio::test]
 async fn non_stream_reasoning_content() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -353,7 +370,8 @@ async fn non_stream_reasoning_content() {
 
 #[tokio::test]
 async fn stream_reasoning_content() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let events = send_stream(
         router,
         json!({
@@ -383,7 +401,8 @@ async fn stream_reasoning_content() {
 
 #[tokio::test]
 async fn non_stream_tool_choice_auto() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -411,7 +430,8 @@ async fn non_stream_tool_choice_auto() {
 
 #[tokio::test]
 async fn non_stream_tool_choice_required() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -444,7 +464,8 @@ async fn non_stream_tool_choice_required() {
 
 #[tokio::test]
 async fn non_stream_named_tool_choice() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -470,7 +491,8 @@ async fn non_stream_named_tool_choice() {
 
 #[tokio::test]
 async fn non_stream_multiple_tools() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -507,7 +529,8 @@ async fn non_stream_multiple_tools() {
 
 #[tokio::test]
 async fn stream_tool_calls() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let events = send_stream(
         router,
         json!({
@@ -537,8 +560,9 @@ async fn stream_tool_calls() {
 
 #[tokio::test]
 async fn local_tool_auto_execution() {
+    require_api_key!();
     let _guard = rate_limit().await;
-    let mut settings = mimo_settings();
+    let Some(mut settings) = mimo_settings() else { return; };
     settings.local_tools.insert(
         "get_weather".to_owned(),
         cc2rep::config::LocalToolSettings {
@@ -594,7 +618,8 @@ async fn local_tool_auto_execution() {
 
 #[tokio::test]
 async fn non_stream_multi_turn() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -623,7 +648,8 @@ async fn non_stream_multi_turn() {
 
 #[tokio::test]
 async fn non_stream_instructions() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -655,7 +681,8 @@ async fn non_stream_instructions() {
 
 #[tokio::test]
 async fn previous_response_id() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
 
     // First request
     let body1 = send_json(
@@ -695,8 +722,9 @@ async fn previous_response_id() {
 
 #[tokio::test]
 async fn model_alias() {
+    require_api_key!();
     let _guard = rate_limit().await;
-    let mut settings = mimo_settings();
+    let Some(mut settings) = mimo_settings() else { return; };
     settings
         .model_aliases
         .insert("my-alias".to_owned(), MIMO_MODEL.to_owned());
@@ -723,7 +751,8 @@ async fn model_alias() {
 
 #[tokio::test]
 async fn response_get_and_delete() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
 
     // Create response
     let body = send_json(
@@ -790,7 +819,8 @@ async fn response_get_and_delete() {
 
 #[tokio::test]
 async fn response_list_input_items() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
 
     let body = send_json(
         router,
@@ -832,7 +862,8 @@ async fn response_list_input_items() {
 
 #[tokio::test]
 async fn cancel_nonexistent_returns_400() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let response = send(
         router,
         Request::builder()
@@ -852,7 +883,8 @@ async fn cancel_nonexistent_returns_400() {
 
 #[tokio::test]
 async fn non_object_body_returns_400() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let response = send(
         router,
         Request::builder()
@@ -869,7 +901,8 @@ async fn non_object_body_returns_400() {
 
 #[tokio::test]
 async fn missing_input_returns_400() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let (status, _) = send_json_expect_error(
         router,
         json!({
@@ -882,7 +915,8 @@ async fn missing_input_returns_400() {
 
 #[tokio::test]
 async fn delete_missing_returns_400() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let response = send(
         router,
         Request::builder()
@@ -898,7 +932,8 @@ async fn delete_missing_returns_400() {
 
 #[tokio::test]
 async fn get_missing_returns_400() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let response = send(
         router,
         Request::builder()
@@ -918,8 +953,9 @@ async fn get_missing_returns_400() {
 
 #[tokio::test]
 async fn drop_tools_ignores_tool_definitions() {
+    require_api_key!();
     let _guard = rate_limit().await;
-    let mut settings = mimo_settings();
+    let Some(mut settings) = mimo_settings() else { return; };
     settings.drop_tools = true;
     let caps = probe_upstream(&settings).await;
     let router = build_router(settings, caps);
@@ -952,7 +988,8 @@ async fn drop_tools_ignores_tool_definitions() {
 
 #[tokio::test]
 async fn store_false_not_persisted() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -986,7 +1023,8 @@ async fn store_false_not_persisted() {
 
 #[tokio::test]
 async fn parallel_tool_calls_setting() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -1007,7 +1045,8 @@ async fn parallel_tool_calls_setting() {
 
 #[tokio::test]
 async fn response_has_correct_format() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -1027,7 +1066,8 @@ async fn response_has_correct_format() {
 
 #[tokio::test]
 async fn usage_fields_present() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -1056,7 +1096,8 @@ async fn usage_fields_present() {
 
 #[tokio::test]
 async fn stream_output_item_order() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let events = send_stream(
         router,
         json!({
@@ -1101,7 +1142,8 @@ async fn stream_output_item_order() {
 
 #[tokio::test]
 async fn string_input_works() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -1116,7 +1158,8 @@ async fn string_input_works() {
 
 #[tokio::test]
 async fn array_input_works() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -1135,7 +1178,8 @@ async fn array_input_works() {
 
 #[tokio::test]
 async fn max_output_tokens_zero_is_ignored() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -1151,7 +1195,8 @@ async fn max_output_tokens_zero_is_ignored() {
 
 #[tokio::test]
 async fn temperature_and_top_p_passed_through() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
@@ -1168,7 +1213,8 @@ async fn temperature_and_top_p_passed_through() {
 
 #[tokio::test]
 async fn stop_sequences_passed_through() {
-    let router = shared_router().await;
+    require_api_key!();
+    let Some(router) = shared_router().await else { return; };
     let body = send_json(
         router,
         json!({
