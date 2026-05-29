@@ -1,14 +1,26 @@
-use std::path::PathBuf;
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+};
 
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use cc2rep::{Settings, build_router, probe_upstream};
+use cc2rep::{
+    Settings, build_router,
+    cli::{ServeConfig, parse_config_selection, prepare_serve_config, stats_endpoint},
+    probe_upstream,
+};
 
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(
+    author,
+    version,
+    about = "OpenAI Responses-compatible proxy for chat/completions backends",
+    arg_required_else_help = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -18,15 +30,15 @@ struct Cli {
 enum Commands {
     /// Start the proxy server
     Serve {
-        /// Path to configuration file
-        #[arg(long)]
-        config: PathBuf,
+        /// Path to the config JSON file
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
     },
     /// Show proxy statistics
     Stats {
-        /// Path to configuration file (used to determine proxy address)
-        #[arg(long)]
-        config: PathBuf,
+        /// Proxy base URL, for example: http://127.0.0.1:8800
+        #[arg(long, default_value = "http://127.0.0.1:8800", value_name = "URL")]
+        url: String,
     },
 }
 
@@ -43,14 +55,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Serve { config } => cmd_serve(config).await,
-        Commands::Stats { config } => cmd_stats(config).await,
+        Commands::Stats { url } => cmd_stats(url).await,
     }
 }
 
-async fn cmd_serve(config: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_serve(config: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let config = resolve_serve_config(config)?;
     let settings = Settings::load(&config)?;
     let addr = settings.socket_addr()?;
     info!(
+        config = %config.display(),
         upstream_url = %settings.upstream_url(),
         upstream_model = %settings.upstream_model,
         "proxy configured"
@@ -64,22 +78,10 @@ async fn cmd_serve(config: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn cmd_stats(config: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let settings = Settings::load(&config)?;
-    let url = format!(
-        "http://{}:{}/stats",
-        settings.proxy_host, settings.proxy_port
-    );
-
+async fn cmd_stats(url: String) -> Result<(), Box<dyn std::error::Error>> {
+    let url = stats_endpoint(&url)?;
     let client = reqwest::Client::new();
-    let resp = client
-        .get(&url)
-        .header(
-            "authorization",
-            format!("Bearer {}", settings.proxy_api_key),
-        )
-        .send()
-        .await?;
+    let resp = client.get(&url).send().await?;
 
     if !resp.status().is_success() {
         eprintln!("error: HTTP {}", resp.status());
@@ -93,6 +95,47 @@ async fn cmd_stats(config: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let stats: Value = resp.json().await?;
     print_stats(&stats);
     Ok(())
+}
+
+fn resolve_serve_config(config: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    match prepare_serve_config(config, std::path::Path::new("."))? {
+        ServeConfig::Explicit(path) => Ok(path),
+        ServeConfig::Candidates(candidates) => prompt_for_config(&candidates).map_err(Into::into),
+    }
+}
+
+fn prompt_for_config(candidates: &[PathBuf]) -> io::Result<PathBuf> {
+    println!("No --config provided. Select a config file from the current directory:");
+    println!();
+    for (index, path) in candidates.iter().enumerate() {
+        println!("  {}. {}", index + 1, path.display());
+    }
+    println!();
+
+    loop {
+        print!("Enter a number [1-{}, default: 1]: ", candidates.len());
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        let bytes = io::stdin().read_line(&mut input)?;
+        if bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "stdin closed before a config was selected",
+            ));
+        }
+
+        match parse_config_selection(&input, candidates.len()) {
+            Ok(index) => {
+                println!("Using {}", candidates[index].display());
+                println!();
+                return Ok(candidates[index].clone());
+            }
+            Err(message) => {
+                eprintln!("{message}");
+            }
+        }
+    }
 }
 
 fn print_stats(stats: &Value) {

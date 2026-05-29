@@ -14,8 +14,15 @@
 ## 快速开始
 
 ```bash
-# 最小配置只需 URL + API Key + Model
-cargo run -- --config ./config.example.json
+# 启动代理；如果不传 --config，会在当前目录的 config.*.json 里让你选择
+cargo run -- serve --config ./config.example.json
+cargo run -- serve
+
+# 查看运行中代理的统计信息
+cargo run -- stats
+
+# 指定代理地址
+cargo run -- stats --url http://127.0.0.1:8800
 ```
 
 Codex 或其他客户端将 `base_url` 指向这个服务，并使用 `proxy_api_key` 作为 Bearer token。
