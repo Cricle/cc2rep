@@ -538,16 +538,16 @@ fn validate_reasoning(payload: &Map<String, Value>) -> Result<(), ProxyError> {
             )));
         }
     }
-    if let Some(summary) = map.get("summary") {
-        if !summary.is_null() {
-            let summary_str = summary.as_str().ok_or_else(|| {
-                ProxyError::bad_request("reasoning.summary must be a string or null")
-            })?;
-            if !matches!(summary_str, "auto" | "concise" | "detailed") {
-                return Err(ProxyError::bad_request(format!(
-                    "reasoning.summary must be \"auto\", \"concise\", \"detailed\", or null, got \"{summary_str}\""
-                )));
-            }
+    if let Some(summary) = map.get("summary")
+        && !summary.is_null()
+    {
+        let summary_str = summary
+            .as_str()
+            .ok_or_else(|| ProxyError::bad_request("reasoning.summary must be a string or null"))?;
+        if !matches!(summary_str, "auto" | "concise" | "detailed") {
+            return Err(ProxyError::bad_request(format!(
+                "reasoning.summary must be \"auto\", \"concise\", \"detailed\", or null, got \"{summary_str}\""
+            )));
         }
     }
     Ok(())

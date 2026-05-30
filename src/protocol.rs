@@ -29,6 +29,7 @@ const EMULATED_FIELDS: &[&str] = &[
     "reasoning",
     "store",
 ];
+#[allow(dead_code)]
 const UNSUPPORTED_FIELDS: &[&str] = &["background", "prompt", "prompt_cache_key", "service_tier"];
 
 #[derive(Debug, Clone)]
@@ -109,8 +110,6 @@ pub fn analyze_protocol(payload: &Map<String, Value>) -> ProtocolReport {
             supported.push(key.clone());
         } else if EMULATED_FIELDS.contains(&key.as_str()) {
             emulated.push(key.clone());
-        } else if UNSUPPORTED_FIELDS.contains(&key.as_str()) {
-            unsupported.push(key.clone());
         } else {
             unsupported.push(key.clone());
         }
