@@ -39,10 +39,26 @@ impl ProbeReport {
     pub fn print(&self) {
         println!("Upstream capability probe results:");
         println!();
-        println!("  {:<35} {}", "named tool_choice", fmt_bool(self.named_tool_choice));
-        println!("  {:<35} {}", "tool_choice: required", fmt_bool(self.tool_choice_required));
-        println!("  {:<35} {}", "reasoning_content", fmt_bool(self.reasoning_content));
-        println!("  {:<35} {}", "reasoning_effort", fmt_bool(self.reasoning_effort));
+        println!(
+            "  {:<35} {}",
+            "named tool_choice",
+            fmt_bool(self.named_tool_choice)
+        );
+        println!(
+            "  {:<35} {}",
+            "tool_choice: required",
+            fmt_bool(self.tool_choice_required)
+        );
+        println!(
+            "  {:<35} {}",
+            "reasoning_content",
+            fmt_bool(self.reasoning_content)
+        );
+        println!(
+            "  {:<35} {}",
+            "reasoning_effort",
+            fmt_bool(self.reasoning_effort)
+        );
         println!("  {:<35} {}", "image input", fmt_bool(self.image_input));
     }
 }
@@ -124,7 +140,10 @@ fn parse_model_list(body: &str) -> Vec<ModelInfo> {
 
 /// Suggest model aliases based on available models and the configured upstream model.
 /// Returns a map of well-known model names → actual upstream model ID.
-pub fn suggest_aliases(models: &[ModelInfo], upstream_model: &str) -> std::collections::HashMap<String, String> {
+pub fn suggest_aliases(
+    models: &[ModelInfo],
+    upstream_model: &str,
+) -> std::collections::HashMap<String, String> {
     use std::collections::HashMap;
     let mut aliases = HashMap::new();
 
@@ -137,8 +156,23 @@ pub fn suggest_aliases(models: &[ModelInfo], upstream_model: &str) -> std::colle
     let reasoning_model = find_reasoning_model(models, upstream_model);
 
     // Common model names that clients might request
-    let chat_names = ["gpt-5-codex", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"];
-    let reasoning_names = ["o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini", "deepseek-reasoner"];
+    let chat_names = [
+        "gpt-5-codex",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4-turbo",
+        "gpt-4",
+        "gpt-3.5-turbo",
+    ];
+    let reasoning_names = [
+        "o1",
+        "o1-mini",
+        "o1-preview",
+        "o3",
+        "o3-mini",
+        "o4-mini",
+        "deepseek-reasoner",
+    ];
 
     for name in chat_names {
         if name != chat_model {
@@ -393,7 +427,13 @@ pub async fn probe_upstream(settings: &Settings) -> Capabilities {
             "reasoning_effort": "low",
             "stream": false
         });
-        match client.post(&url).headers(headers.clone()).json(&effort_body).send().await {
+        match client
+            .post(&url)
+            .headers(headers.clone())
+            .json(&effort_body)
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 info!("upstream supports reasoning_effort");
                 caps.supports_reasoning_effort = true;
@@ -470,8 +510,12 @@ mod tests {
     #[test]
     fn suggest_aliases_maps_common_names() {
         let models = vec![
-            ModelInfo { id: "deepseek-chat".to_owned() },
-            ModelInfo { id: "deepseek-reasoner".to_owned() },
+            ModelInfo {
+                id: "deepseek-chat".to_owned(),
+            },
+            ModelInfo {
+                id: "deepseek-reasoner".to_owned(),
+            },
         ];
         let aliases = suggest_aliases(&models, "deepseek-chat");
         assert_eq!(aliases.get("gpt-5-codex").unwrap(), "deepseek-chat");
@@ -482,9 +526,9 @@ mod tests {
 
     #[test]
     fn suggest_aliases_single_model() {
-        let models = vec![
-            ModelInfo { id: "mimo-v2.5-pro".to_owned() },
-        ];
+        let models = vec![ModelInfo {
+            id: "mimo-v2.5-pro".to_owned(),
+        }];
         let aliases = suggest_aliases(&models, "mimo-v2.5-pro");
         assert_eq!(aliases.get("gpt-5-codex").unwrap(), "mimo-v2.5-pro");
         // No distinct reasoning model, so o1 maps to the same
@@ -506,4 +550,3 @@ mod tests {
         assert!(!is_reasoning_model("gpt-4o"));
     }
 }
-

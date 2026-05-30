@@ -17,4 +17,7 @@ pub mod upstream;
 
 pub use app::build_router;
 pub use config::Settings;
-pub use probe::{Capabilities, ModelInfo, ProbeReport, list_models, probe_report, probe_upstream, suggest_aliases};
+pub use probe::{
+    Capabilities, ModelInfo, ProbeReport, list_models, probe_report, probe_upstream,
+    suggest_aliases,
+};

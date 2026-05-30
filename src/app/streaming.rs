@@ -385,4 +385,3 @@ pub(crate) fn stream_response_with_auto_tools(
         .keep_alive(KeepAlive::default())
         .into_response()
 }
-

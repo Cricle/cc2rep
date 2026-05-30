@@ -3,9 +3,7 @@ use serde_json::Value;
 use crate::{
     error::ProxyError,
     tools::{ToolExecutor, append_tool_outputs},
-    translate::{
-        merge_usage, parse_assistant_turn_from_response, usage_from_upstream,
-    },
+    translate::{merge_usage, parse_assistant_turn_from_response, usage_from_upstream},
 };
 
 use super::{AppState, NonStreamExecution};
@@ -105,4 +103,3 @@ pub(crate) fn should_auto_execute_tools(
                     .unwrap_or(false)
         })
 }
-

@@ -23,13 +23,8 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::{
-    config::Settings,
-    metrics::RequestMetrics,
-    probe::Capabilities,
-    store::ResponseStore,
-    tools::ToolExecutor,
-    translate::AssistantTurn,
-    upstream::UpstreamClient,
+    config::Settings, metrics::RequestMetrics, probe::Capabilities, store::ResponseStore,
+    tools::ToolExecutor, translate::AssistantTurn, upstream::UpstreamClient,
 };
 
 pub(crate) use exec::{execute_non_stream_turn, should_auto_execute_tools};
@@ -87,7 +82,6 @@ impl InflightRegistry {
     }
 }
 
-
 pub fn build_router(settings: Settings, capabilities: Capabilities) -> Router {
     let settings = Arc::new(settings);
     let upstream = UpstreamClient::new(settings.clone()).expect("invalid settings");
@@ -123,4 +117,3 @@ pub fn build_router(settings: Settings, capabilities: Capabilities) -> Router {
         )
         .with_state(state)
 }
-

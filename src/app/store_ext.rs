@@ -50,4 +50,3 @@ pub(crate) async fn store_final_response(
         )
         .await
 }
-

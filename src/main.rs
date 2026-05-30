@@ -115,10 +115,7 @@ async fn cmd_probe(config: Option<PathBuf>, write: bool) -> Result<(), Box<dyn s
     println!();
 
     // Probe capabilities and models in parallel
-    let (report_result, models) = tokio::join!(
-        probe_report(&settings),
-        list_models(&settings),
-    );
+    let (report_result, models) = tokio::join!(probe_report(&settings), list_models(&settings),);
     let (_caps, report) = report_result;
 
     // Print capabilities
@@ -131,7 +128,11 @@ async fn cmd_probe(config: Option<PathBuf>, write: bool) -> Result<(), Box<dyn s
     } else {
         println!("Available models ({}):", models.len());
         for m in &models {
-            let marker = if m.id == settings.upstream_model { " <-- upstream_model" } else { "" };
+            let marker = if m.id == settings.upstream_model {
+                " <-- upstream_model"
+            } else {
+                ""
+            };
             println!("  {}{}", m.id, marker);
         }
     }
@@ -164,11 +165,26 @@ async fn cmd_probe(config: Option<PathBuf>, write: bool) -> Result<(), Box<dyn s
             .ok_or("config file must be a JSON object")?;
 
         // Write capabilities
-        obj.insert("upstream_supports_named_tool_choice".to_owned(), serde_json::json!(report.named_tool_choice));
-        obj.insert("upstream_supports_tool_choice_required".to_owned(), serde_json::json!(report.tool_choice_required));
-        obj.insert("upstream_supports_reasoning_content".to_owned(), serde_json::json!(report.reasoning_content));
-        obj.insert("upstream_supports_reasoning_effort".to_owned(), serde_json::json!(report.reasoning_effort));
-        obj.insert("upstream_supports_image_input".to_owned(), serde_json::json!(report.image_input));
+        obj.insert(
+            "upstream_supports_named_tool_choice".to_owned(),
+            serde_json::json!(report.named_tool_choice),
+        );
+        obj.insert(
+            "upstream_supports_tool_choice_required".to_owned(),
+            serde_json::json!(report.tool_choice_required),
+        );
+        obj.insert(
+            "upstream_supports_reasoning_content".to_owned(),
+            serde_json::json!(report.reasoning_content),
+        );
+        obj.insert(
+            "upstream_supports_reasoning_effort".to_owned(),
+            serde_json::json!(report.reasoning_effort),
+        );
+        obj.insert(
+            "upstream_supports_image_input".to_owned(),
+            serde_json::json!(report.image_input),
+        );
 
         // Write model aliases
         if !aliases.is_empty() {
@@ -176,13 +192,19 @@ async fn cmd_probe(config: Option<PathBuf>, write: bool) -> Result<(), Box<dyn s
                 .iter()
                 .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                 .collect();
-            obj.insert("model_aliases".to_owned(), serde_json::Value::Object(alias_obj));
+            obj.insert(
+                "model_aliases".to_owned(),
+                serde_json::Value::Object(alias_obj),
+            );
         }
 
         let formatted = serde_json::to_string_pretty(&doc)?;
         std::fs::write(&config, formatted + "\n")?;
         println!();
-        println!("Wrote capabilities and model_aliases to {}", config.display());
+        println!(
+            "Wrote capabilities and model_aliases to {}",
+            config.display()
+        );
     } else {
         println!();
         println!("Run with --write to persist these results to the config file.");

@@ -23,13 +23,13 @@ const SUPPORTED_FIELDS: &[&str] = &[
     "user",
 ];
 
-const EMULATED_FIELDS: &[&str] = &["max_tool_calls", "parallel_tool_calls", "reasoning", "store"];
-const UNSUPPORTED_FIELDS: &[&str] = &[
-    "background",
-    "prompt",
-    "prompt_cache_key",
-    "service_tier",
+const EMULATED_FIELDS: &[&str] = &[
+    "max_tool_calls",
+    "parallel_tool_calls",
+    "reasoning",
+    "store",
 ];
+const UNSUPPORTED_FIELDS: &[&str] = &["background", "prompt", "prompt_cache_key", "service_tier"];
 
 #[derive(Debug, Clone)]
 pub struct ProtocolReport {
@@ -146,7 +146,10 @@ mod tests {
 
         let report = analyze_protocol(&payload);
         assert_eq!(report.supported_fields, vec!["input", "model"]);
-        assert_eq!(report.emulated_fields, vec!["parallel_tool_calls", "reasoning", "store"]);
+        assert_eq!(
+            report.emulated_fields,
+            vec!["parallel_tool_calls", "reasoning", "store"]
+        );
         assert_eq!(report.unsupported_fields, vec!["background", "zzz"]);
         assert!(report.has_compatibility_notes());
     }
@@ -168,7 +171,9 @@ mod tests {
         let fragment = report.metadata_fragment();
         assert_eq!(fragment["compatibility"]["mode"], "chat_completions_bridge");
         assert_eq!(fragment["compatibility"]["supported_fields"][0], "input");
-        let unsupported = fragment["compatibility"]["unsupported_fields"].as_array().unwrap();
+        let unsupported = fragment["compatibility"]["unsupported_fields"]
+            .as_array()
+            .unwrap();
         assert!(unsupported.iter().any(|v| v.as_str() == Some("prompt")));
         assert!(unsupported.iter().any(|v| v.as_str() == Some("unknown")));
     }

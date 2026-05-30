@@ -214,16 +214,32 @@ mod tests {
         let raw = fs::read_to_string(&path).unwrap();
         let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let obj = doc.as_object_mut().unwrap();
-        obj.insert("upstream_supports_named_tool_choice".to_owned(), serde_json::json!(true));
-        obj.insert("upstream_supports_tool_choice_required".to_owned(), serde_json::json!(false));
-        obj.insert("upstream_supports_reasoning_content".to_owned(), serde_json::json!(true));
-        obj.insert("upstream_supports_reasoning_effort".to_owned(), serde_json::json!(true));
-        obj.insert("upstream_supports_image_input".to_owned(), serde_json::json!(false));
+        obj.insert(
+            "upstream_supports_named_tool_choice".to_owned(),
+            serde_json::json!(true),
+        );
+        obj.insert(
+            "upstream_supports_tool_choice_required".to_owned(),
+            serde_json::json!(false),
+        );
+        obj.insert(
+            "upstream_supports_reasoning_content".to_owned(),
+            serde_json::json!(true),
+        );
+        obj.insert(
+            "upstream_supports_reasoning_effort".to_owned(),
+            serde_json::json!(true),
+        );
+        obj.insert(
+            "upstream_supports_image_input".to_owned(),
+            serde_json::json!(false),
+        );
         let formatted = serde_json::to_string_pretty(&doc).unwrap();
         fs::write(&path, formatted + "\n").unwrap();
 
         // Verify the file is valid JSON and has the new fields
-        let updated: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let updated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(updated["upstream_supports_named_tool_choice"], true);
         assert_eq!(updated["upstream_supports_tool_choice_required"], false);
         assert_eq!(updated["upstream_supports_reasoning_content"], true);
@@ -232,5 +248,4 @@ mod tests {
         // Original fields preserved
         assert_eq!(updated["proxy_host"], "127.0.0.1");
     }
-
 }

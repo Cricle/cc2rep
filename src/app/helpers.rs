@@ -15,4 +15,3 @@ pub(crate) fn translated_with_request_messages(
     translated.request_messages = request_messages;
     translated
 }
-

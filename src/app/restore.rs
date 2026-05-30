@@ -140,4 +140,3 @@ pub(crate) fn context_from_response(response: &Value) -> Result<RequestContext, 
         skip_reasoning_output: false,
     })
 }
-

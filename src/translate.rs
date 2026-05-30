@@ -521,7 +521,6 @@ pub(crate) fn stringify_json_value(value: &Value) -> Result<String, ProxyError> 
     }
 }
 
-
 fn validate_reasoning(payload: &Map<String, Value>) -> Result<(), ProxyError> {
     let Some(reasoning) = payload.get("reasoning") else {
         return Ok(());
@@ -541,9 +540,9 @@ fn validate_reasoning(payload: &Map<String, Value>) -> Result<(), ProxyError> {
     }
     if let Some(summary) = map.get("summary") {
         if !summary.is_null() {
-            let summary_str = summary
-                .as_str()
-                .ok_or_else(|| ProxyError::bad_request("reasoning.summary must be a string or null"))?;
+            let summary_str = summary.as_str().ok_or_else(|| {
+                ProxyError::bad_request("reasoning.summary must be a string or null")
+            })?;
             if !matches!(summary_str, "auto" | "concise" | "detailed") {
                 return Err(ProxyError::bad_request(format!(
                     "reasoning.summary must be \"auto\", \"concise\", \"detailed\", or null, got \"{summary_str}\""
@@ -565,7 +564,11 @@ fn parse_reasoning_params(
     };
     let effort = map.get("effort").and_then(Value::as_str).map(str::to_owned);
     let summary = if let Some(val) = map.get("summary") {
-        if val.is_null() { None } else { val.as_str().map(str::to_owned) }
+        if val.is_null() {
+            None
+        } else {
+            val.as_str().map(str::to_owned)
+        }
     } else {
         None
     };
@@ -576,7 +579,9 @@ fn parse_include_array(payload: &Map<String, Value>) -> Vec<String> {
     let Some(Value::Array(arr)) = payload.get("include") else {
         return Vec::new();
     };
-    arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()
+    arr.iter()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect()
 }
 
 fn validate_text_format(payload: &Map<String, Value>) -> Result<(), ProxyError> {
