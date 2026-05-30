@@ -53,8 +53,11 @@ pub fn build_failed_response(
         "output": build_output_items(context, turn, "incomplete"),
         "output_text": turn.text,
         "parallel_tool_calls": context.parallel_tool_calls,
-        "previous_response_id": null,
+        "previous_response_id": context.previous_response_id,
         "store": context.store,
+        "temperature": context.temperature,
+        "top_p": context.top_p,
+        "truncation": context.truncation,
         "text": { "format": { "type": "text" } },
         "tool_choice": context.tool_choice,
         "tools": context.tools,
@@ -78,8 +81,11 @@ pub fn build_in_progress_response(context: &RequestContext) -> Value {
         "output": [],
         "output_text": "",
         "parallel_tool_calls": context.parallel_tool_calls,
-        "previous_response_id": null,
+        "previous_response_id": context.previous_response_id,
         "store": context.store,
+        "temperature": context.temperature,
+        "top_p": context.top_p,
+        "truncation": context.truncation,
         "text": { "format": { "type": "text" } },
         "tool_choice": context.tool_choice,
         "tools": context.tools,
@@ -158,8 +164,11 @@ fn build_response_with_status(
         "output": build_output_items(context, turn, status),
         "output_text": turn.text,
         "parallel_tool_calls": context.parallel_tool_calls,
-        "previous_response_id": null,
+        "previous_response_id": context.previous_response_id,
         "store": context.store,
+        "temperature": context.temperature,
+        "top_p": context.top_p,
+        "truncation": context.truncation,
         "text": { "format": { "type": "text" } },
         "tool_choice": context.tool_choice,
         "tools": context.tools,
@@ -170,7 +179,7 @@ fn build_response_with_status(
 fn build_output_items(context: &RequestContext, turn: &AssistantTurn, status: &str) -> Vec<Value> {
     let mut output = Vec::new();
     output.extend(context.hosted_output_items.iter().cloned());
-    if !turn.reasoning.is_empty() {
+    if !context.skip_reasoning_output && !turn.reasoning.is_empty() {
         output.push(build_reasoning_item(context, status, &turn.reasoning));
     }
     if !turn.text.is_empty() || turn.tool_calls.is_empty() {

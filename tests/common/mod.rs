@@ -64,6 +64,7 @@ pub fn mimo_settings() -> Option<Settings> {
         max_auto_tool_rounds: 8,
         upstream_max_retries: 3,
         upstream_retry_base_delay_ms: 1000,
+        upstream_reasoning_effort_field: "reasoning_effort".to_owned(),
         web_search_url: None,
         web_search_max_results: 5,
         file_search_paths: Vec::new(),

@@ -56,6 +56,8 @@ pub struct Settings {
     pub upstream_max_retries: u32,
     #[serde(default = "default_upstream_retry_base_delay_ms")]
     pub upstream_retry_base_delay_ms: u64,
+    #[serde(default = "default_upstream_reasoning_effort_field")]
+    pub upstream_reasoning_effort_field: String,
     #[serde(default)]
     pub web_search_url: Option<String>,
     #[serde(default = "default_web_search_max_results")]
@@ -117,6 +119,10 @@ fn default_upstream_retry_base_delay_ms() -> u64 {
 
 fn default_response_ttl_seconds() -> u64 {
     3600
+}
+
+fn default_upstream_reasoning_effort_field() -> String {
+    "reasoning_effort".to_owned()
 }
 
 fn default_web_search_max_results() -> usize {
@@ -260,6 +266,7 @@ mod tests {
             max_auto_tool_rounds: 8,
             upstream_max_retries: 3,
             upstream_retry_base_delay_ms: 1000,
+            upstream_reasoning_effort_field: "reasoning_effort".to_owned(),
             web_search_url: None,
             web_search_max_results: 5,
             file_search_paths: Vec::new(),

@@ -1,778 +1,33 @@
-use std::{
-    collections::HashMap,
-    convert::Infallible,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use async_stream::stream;
 use axum::{
-    Router,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, KeepAlive, Sse},
-    },
-    routing::{get, post},
+    Json, Router,
+    body::Body,
+    extract::{Path, Request, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, sse::{Event, Sse}},
+    routing::post,
 };
-use futures_util::StreamExt;
+use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tower::ServiceExt;
 
-use crate::{
-    config::Settings,
-    error::ProxyError,
-    metrics::RequestMetrics,
-    probe::Capabilities,
-    store::{ResponseStore, StoredResponse},
-    stream::{
-        SseParser, StreamRoundOutcome, StreamState, apply_stream_delta, collect_stream_turn,
-        finalize_stream_items, json_event,
-    },
-    tools::{ToolExecutor, append_tool_outputs},
-    translate::{
-        AssistantTurn, RequestContext, ToolCall, build_cancelled_response, build_failed_response,
-        build_history_message, build_in_progress_response, build_response, merge_usage,
-        parse_assistant_turn_from_response, unix_timestamp, usage_from_upstream,
-    },
-    upstream::UpstreamClient,
+use super::*;
+use crate::config::Settings;
+use crate::handlers::{authorize, cancel_response};
+use crate::metrics::RequestMetrics;
+use crate::probe::Capabilities;
+use crate::store::{ResponseStore, StoredResponse};
+use crate::stream::{
+    SseParser, StreamState, apply_stream_delta, finalize_stream_items, json_event, parse_sse_event,
 };
-
-#[derive(Clone)]
-pub(crate) struct AppState {
-    pub settings: Arc<Settings>,
-    pub capabilities: Capabilities,
-    pub upstream: UpstreamClient,
-    pub http_client: reqwest::Client,
-    pub tool_executor: ToolExecutor,
-    pub store: ResponseStore,
-    pub inflight: InflightRegistry,
-    pub metrics: Arc<RequestMetrics>,
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct InflightRegistry {
-    inner: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
-}
-
-#[derive(Clone)]
-pub(crate) struct NonStreamExecution {
-    pub turn: AssistantTurn,
-    pub usage: Value,
-    pub request_messages: Vec<Value>,
-}
-
-impl InflightRegistry {
-    pub(crate) async fn start(&self, response_id: String) -> Arc<AtomicBool> {
-        let token = Arc::new(AtomicBool::new(false));
-        self.inner.write().await.insert(response_id, token.clone());
-        token
-    }
-
-    pub(crate) async fn cancel(&self, response_id: &str) -> bool {
-        let guard = self.inner.read().await;
-        let Some(flag) = guard.get(response_id) else {
-            return false;
-        };
-        flag.store(true, Ordering::SeqCst);
-        true
-    }
-
-    pub(crate) async fn finish(&self, response_id: &str) {
-        self.inner.write().await.remove(response_id);
-    }
-
-    pub(crate) async fn count(&self) -> usize {
-        self.inner.read().await.len()
-    }
-}
-
-pub fn build_router(settings: Settings, capabilities: Capabilities) -> Router {
-    let settings = Arc::new(settings);
-    let upstream = UpstreamClient::new(settings.clone()).expect("invalid settings");
-    let store = ResponseStore::with_ttl(settings.response_ttl_seconds);
-    store.start_cleanup_task();
-    let http_client = reqwest::Client::new();
-    let state = AppState {
-        tool_executor: ToolExecutor::new(settings.clone()),
-        store,
-        capabilities,
-        settings,
-        upstream,
-        http_client,
-        inflight: InflightRegistry::default(),
-        metrics: Arc::new(RequestMetrics::default()),
-    };
-
-    Router::new()
-        .route("/healthz", get(crate::handlers::healthz))
-        .route("/stats", get(crate::handlers::stats))
-        .route("/v1/responses", post(crate::handlers::create_response))
-        .route(
-            "/v1/responses/{response_id}",
-            get(crate::handlers::get_response).delete(crate::handlers::delete_response),
-        )
-        .route(
-            "/v1/responses/{response_id}/input_items",
-            get(crate::handlers::list_input_items),
-        )
-        .route(
-            "/v1/responses/{response_id}/cancel",
-            post(crate::handlers::cancel_response),
-        )
-        .with_state(state)
-}
-
-pub(crate) async fn execute_non_stream_turn(
-    state: &AppState,
-    translated: &crate::translate::TranslatedRequest,
-) -> Result<NonStreamExecution, ProxyError> {
-    let mut upstream_payload = translated.upstream_payload.clone();
-    let mut last_upstream = state.upstream.chat_json(&upstream_payload).await?;
-    let mut turn = parse_assistant_turn_from_response(&last_upstream)?;
-    let mut total_usage = usage_from_upstream(last_upstream.get("usage"));
-
-    if !state.tool_executor.has_local_tools() {
-        return Ok(NonStreamExecution {
-            turn,
-            usage: total_usage,
-            request_messages: translated.request_messages.clone(),
-        });
-    }
-
-    let max_tool_calls = translated.context.max_tool_calls;
-    let mut total_tool_calls: u32 = 0;
-
-    for _ in 0..state.settings.max_auto_tool_rounds {
-        let supported: Vec<_> = turn
-            .tool_calls
-            .iter()
-            .filter(|tc| state.tool_executor.supports_tool(&tc.name))
-            .cloned()
-            .collect();
-        if supported.is_empty() {
-            break;
-        }
-        if let Some(limit) = max_tool_calls {
-            total_tool_calls += supported.len() as u32;
-            if total_tool_calls > limit {
-                break;
-            }
-        }
-
-        let Some(outputs) = state
-            .tool_executor
-            .execute_calls(&supported, translated.context.parallel_tool_calls)
-            .await?
-        else {
-            break;
-        };
-        {
-            let Some(payload_map) = upstream_payload.as_object_mut() else {
-                break;
-            };
-            let Some(messages) = payload_map
-                .get_mut("messages")
-                .and_then(Value::as_array_mut)
-            else {
-                break;
-            };
-            append_tool_outputs(messages, &supported, &outputs, Some(&turn.reasoning));
-        }
-
-        last_upstream = state.upstream.chat_json(&upstream_payload).await?;
-        merge_usage(
-            &mut total_usage,
-            &usage_from_upstream(last_upstream.get("usage")),
-        );
-        let next_turn = parse_assistant_turn_from_response(&last_upstream)?;
-        if next_turn.tool_calls.is_empty() {
-            return Ok(NonStreamExecution {
-                turn: next_turn,
-                usage: total_usage,
-                request_messages: extract_request_messages(&upstream_payload),
-            });
-        }
-        turn = next_turn;
-    }
-
-    Ok(NonStreamExecution {
-        turn,
-        usage: total_usage,
-        request_messages: extract_request_messages(&upstream_payload),
-    })
-}
-
-pub(crate) fn should_auto_execute_tools(
-    tool_executor: &ToolExecutor,
-    translated: &crate::translate::TranslatedRequest,
-) -> bool {
-    tool_executor.has_local_tools()
-        && translated.context.tools.iter().any(|tool| {
-            tool.get("type").and_then(Value::as_str) == Some("function")
-                && tool
-                    .get("function")
-                    .and_then(|function| function.get("name"))
-                    .or_else(|| tool.get("name"))
-                    .and_then(Value::as_str)
-                    .map(|name| tool_executor.supports_tool(name))
-                    .unwrap_or(false)
-        })
-}
-
-pub(crate) fn extract_request_messages(payload: &Value) -> Vec<Value> {
-    payload
-        .get("messages")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
-pub(crate) fn translated_with_request_messages(
-    translated: &crate::translate::TranslatedRequest,
-    request_messages: Vec<Value>,
-) -> crate::translate::TranslatedRequest {
-    let mut translated = translated.clone();
-    translated.request_messages = request_messages;
-    translated
-}
-
-pub(crate) fn stream_response(
-    store: ResponseStore,
-    inflight: InflightRegistry,
-    metrics: Arc<RequestMetrics>,
-    cancel_flag: Arc<AtomicBool>,
-    response: reqwest::Response,
-    translated: crate::translate::TranslatedRequest,
-) -> Response {
-    let context = translated.context.clone();
-    let translated_for_store = translated.clone();
-    let response_id = context.response_id.clone();
-    let event_stream = stream! {
-        let mut sequence_number: u64 = 0;
-        let mut state = StreamState::new();
-
-        yield Ok::<Event, Infallible>(json_event("response.created", &mut sequence_number, json!({
-            "type": "response.created",
-            "response": build_in_progress_response(&context),
-        })));
-
-        for (hosted_index, hosted_item) in context.hosted_output_items.iter().enumerate() {
-            yield Ok::<Event, Infallible>(json_event("response.output_item.added", &mut sequence_number, json!({
-                "type": "response.output_item.added",
-                "output_index": hosted_index,
-                "item": hosted_item,
-            })));
-            yield Ok::<Event, Infallible>(json_event("response.output_item.done", &mut sequence_number, json!({
-                "type": "response.output_item.done",
-                "output_index": hosted_index,
-                "item": hosted_item,
-            })));
-        }
-
-        let mut parser = SseParser::default();
-        let mut stream = response.bytes_stream();
-        let mut failed_message: Option<String> = None;
-        let mut cancelled = false;
-
-        'outer: while let Some(chunk) = stream.next().await {
-            if cancel_flag.load(Ordering::SeqCst) {
-                cancelled = true;
-                break 'outer;
-            }
-            match chunk {
-                Ok(bytes) => {
-                    let chunk_text = String::from_utf8_lossy(&bytes);
-                    for event_data in parser.push(&chunk_text) {
-                        if cancel_flag.load(Ordering::SeqCst) {
-                            cancelled = true;
-                            break 'outer;
-                        }
-                        if event_data == "[DONE]" {
-                            break 'outer;
-                        }
-
-                        match serde_json::from_str::<Value>(&event_data) {
-                            Ok(value) => {
-                                if let Some(usage_value) = value.get("usage") {
-                                    state.usage = usage_from_upstream(Some(usage_value));
-                                }
-                                match apply_stream_delta(&mut state, &value, &context, &mut sequence_number) {
-                                    Ok(events) => {
-                                        for event in events {
-                                            yield Ok::<Event, Infallible>(event);
-                                        }
-                                    }
-                                    Err(err) => {
-                                        failed_message = Some(err.to_string());
-                                        break 'outer;
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                failed_message = Some(format!("failed to parse upstream SSE JSON: {err}"));
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    failed_message = Some(err.to_string());
-                    break;
-                }
-            }
-        }
-
-        let assistant_turn = state.take_turn();
-
-        if cancelled {
-            metrics.record_cancellation();
-            let cancelled_response = build_cancelled_response(
-                &context,
-                &assistant_turn,
-                state.usage.clone(),
-                unix_timestamp(),
-            );
-            if let Err(err) = store_final_response(&store, &translated_for_store, cancelled_response.clone()).await {
-                warn!(response_id = %response_id, "failed to store cancelled response: {err}");
-            }
-            let _ = inflight.finish(&response_id).await;
-            yield Ok::<Event, Infallible>(json_event("response.completed", &mut sequence_number, json!({
-                "type": "response.completed",
-                "response": cancelled_response,
-            })));
-            return;
-        }
-
-        if let Some(message) = failed_message {
-            metrics.record_failure();
-            warn!("stream failed: {message}");
-            let failed = build_failed_response(
-                &context,
-                &assistant_turn,
-                unix_timestamp(),
-                &message,
-                "upstream_stream_error",
-            );
-            if let Err(err) = store_final_response(&store, &translated_for_store, failed.clone()).await {
-                warn!(response_id = %response_id, "failed to store failed response: {err}");
-            }
-            let _ = inflight.finish(&response_id).await;
-            yield Ok::<Event, Infallible>(json_event("response.failed", &mut sequence_number, json!({
-                "type": "response.failed",
-                "response": failed,
-            })));
-            return;
-        }
-
-        for event in finalize_stream_items(&assistant_turn, &context, &mut sequence_number) {
-            yield Ok::<Event, Infallible>(event);
-        }
-
-        let final_response = build_response(
-            &context,
-            &assistant_turn,
-            state.usage.clone(),
-            unix_timestamp(),
-        );
-        metrics.record_completion(final_response.get("usage").unwrap_or(&json!({})));
-        if let Err(err) = store_final_response(&store, &translated_for_store, final_response.clone()).await {
-            warn!(response_id = %response_id, "failed to store final response: {err}");
-        }
-        let _ = inflight.finish(&response_id).await;
-        info!(
-            response_id = %response_id,
-            "stream request completed"
-        );
-        yield Ok::<Event, Infallible>(json_event("response.completed", &mut sequence_number, json!({
-            "type": "response.completed",
-            "response": final_response,
-        })));
-    };
-
-    Sse::new(event_stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn stream_response_with_auto_tools(
-    upstream: UpstreamClient,
-    tool_executor: ToolExecutor,
-    settings: Arc<Settings>,
-    store: ResponseStore,
-    inflight: InflightRegistry,
-    metrics: Arc<RequestMetrics>,
-    cancel_flag: Arc<AtomicBool>,
-    response: reqwest::Response,
-    translated: crate::translate::TranslatedRequest,
-) -> Response {
-    let context = translated.context.clone();
-    let response_id = context.response_id.clone();
-    let event_stream = stream! {
-        let mut sequence_number: u64 = 0;
-        yield Ok::<Event, Infallible>(json_event("response.created", &mut sequence_number, json!({
-            "type": "response.created",
-            "response": build_in_progress_response(&context),
-        })));
-
-        for (hosted_index, hosted_item) in context.hosted_output_items.iter().enumerate() {
-            yield Ok::<Event, Infallible>(json_event("response.output_item.added", &mut sequence_number, json!({
-                "type": "response.output_item.added",
-                "output_index": hosted_index,
-                "item": hosted_item,
-            })));
-            yield Ok::<Event, Infallible>(json_event("response.output_item.done", &mut sequence_number, json!({
-                "type": "response.output_item.done",
-                "output_index": hosted_index,
-                "item": hosted_item,
-            })));
-        }
-
-        let mut current_response = response;
-        let mut current_payload = translated.upstream_payload.clone();
-        let mut final_turn = AssistantTurn::default();
-        let mut total_usage = usage_from_upstream(None);
-        let mut failed_message: Option<String> = None;
-        let mut cancelled = false;
-        let max_tool_calls = context.max_tool_calls;
-        let mut total_tool_calls: u32 = 0;
-        let parallel = context.parallel_tool_calls;
-
-        for _ in 0..settings.max_auto_tool_rounds {
-            match collect_stream_turn(&cancel_flag, current_response).await {
-                Ok(StreamRoundOutcome::Cancelled) => {
-                    cancelled = true;
-                    break;
-                }
-                Ok(StreamRoundOutcome::Failed(message)) => {
-                    failed_message = Some(message);
-                    break;
-                }
-                Ok(StreamRoundOutcome::Completed { turn, usage }) => {
-                    merge_usage(&mut total_usage, &usage);
-                    let supported: Vec<_> = turn
-                        .tool_calls
-                        .iter()
-                        .filter(|tc| tool_executor.supports_tool(&tc.name))
-                        .cloned()
-                        .collect();
-                    if supported.is_empty() {
-                        final_turn = turn;
-                        break;
-                    }
-                    if let Some(limit) = max_tool_calls {
-                        total_tool_calls += supported.len() as u32;
-                        if total_tool_calls > limit {
-                            final_turn = turn;
-                            break;
-                        }
-                    }
-
-                    let outputs = match tool_executor.execute_calls(&supported, parallel).await {
-                        Ok(Some(outputs)) => outputs,
-                        Ok(None) => {
-                            final_turn = turn;
-                            break;
-                        }
-                        Err(err) => {
-                            failed_message = Some(err.to_string());
-                            break;
-                        }
-                    };
-                    {
-                        let Some(payload_map) = current_payload.as_object_mut() else {
-                            final_turn = turn;
-                            break;
-                        };
-                        let Some(messages) = payload_map.get_mut("messages").and_then(Value::as_array_mut) else {
-                            final_turn = turn;
-                            break;
-                        };
-                        append_tool_outputs(
-                            messages,
-                            &supported,
-                            &outputs,
-                            Some(&turn.reasoning),
-                        );
-                    }
-
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        cancelled = true;
-                        break;
-                    }
-
-                    match upstream.chat_stream(&current_payload).await {
-                        Ok(next_response) => {
-                            current_response = next_response;
-                        }
-                        Err(err) => {
-                            failed_message = Some(err.to_string());
-                            break;
-                        }
-                    }
-                }
-                Err(err) => {
-                    failed_message = Some(err.to_string());
-                    break;
-                }
-            }
-        }
-
-        if cancelled {
-            metrics.record_cancellation();
-            let cancelled_response = build_cancelled_response(
-                &context,
-                &final_turn,
-                total_usage.clone(),
-                unix_timestamp(),
-            );
-            let translated = translated_with_request_messages(&translated, extract_request_messages(&current_payload));
-            if let Err(err) = store_final_response(&store, &translated, cancelled_response.clone()).await {
-                warn!(response_id = %response_id, "failed to store cancelled response: {err}");
-            }
-            let _ = inflight.finish(&response_id).await;
-            yield Ok::<Event, Infallible>(json_event("response.completed", &mut sequence_number, json!({
-                "type": "response.completed",
-                "response": cancelled_response,
-            })));
-            return;
-        }
-
-        if let Some(message) = failed_message {
-            metrics.record_failure();
-            let failed = build_failed_response(
-                &context,
-                &final_turn,
-                unix_timestamp(),
-                &message,
-                "upstream_stream_error",
-            );
-            let translated = translated_with_request_messages(&translated, extract_request_messages(&current_payload));
-            if let Err(err) = store_final_response(&store, &translated, failed.clone()).await {
-                warn!(response_id = %response_id, "failed to store failed response: {err}");
-            }
-            let _ = inflight.finish(&response_id).await;
-            yield Ok::<Event, Infallible>(json_event("response.failed", &mut sequence_number, json!({
-                "type": "response.failed",
-                "response": failed,
-            })));
-            return;
-        }
-
-        for event in finalize_stream_items(&final_turn, &context, &mut sequence_number) {
-            yield Ok::<Event, Infallible>(event);
-        }
-
-        let final_response = build_response(
-            &context,
-            &final_turn,
-            total_usage,
-            unix_timestamp(),
-        );
-        metrics.record_completion(final_response.get("usage").unwrap_or(&json!({})));
-        let translated = translated_with_request_messages(&translated, extract_request_messages(&current_payload));
-        if let Err(err) = store_final_response(&store, &translated, final_response.clone()).await {
-            warn!(response_id = %response_id, "failed to store final response: {err}");
-        }
-        let _ = inflight.finish(&response_id).await;
-        yield Ok::<Event, Infallible>(json_event("response.completed", &mut sequence_number, json!({
-            "type": "response.completed",
-            "response": final_response,
-        })));
-    };
-
-    Sse::new(event_stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
-}
-
-pub(crate) async fn load_previous_messages(
-    store: &ResponseStore,
-    payload: &serde_json::Map<String, Value>,
-) -> Result<Vec<Value>, ProxyError> {
-    let Some(previous_response_id) = payload.get("previous_response_id").and_then(Value::as_str)
-    else {
-        return Ok(Vec::new());
-    };
-    let stored = store.get(previous_response_id).await?.ok_or_else(|| {
-        ProxyError::bad_request(format!(
-            "previous_response_id `{previous_response_id}` not found"
-        ))
-    })?;
-    let mut messages = stored.request_messages.clone();
-    if let Some(output) = stored.response.get("output").and_then(Value::as_array) {
-        let turn = assistant_turn_from_output(output)?;
-        if let Some(message) = build_history_message(&turn) {
-            messages.push(message);
-        }
-    }
-    Ok(messages)
-}
-
-pub(crate) async fn store_final_response(
-    store: &ResponseStore,
-    translated: &crate::translate::TranslatedRequest,
-    response: Value,
-) -> Result<(), ProxyError> {
-    if !translated.context.store {
-        return Ok(());
-    }
-    store
-        .put(
-            translated.context.response_id.clone(),
-            StoredResponse {
-                response,
-                input_items: translated.input_items.clone(),
-                request_messages: translated.request_messages.clone(),
-                inserted_at: std::time::Instant::now(),
-            },
-        )
-        .await
-}
-
-pub(crate) fn assistant_turn_from_output(output: &[Value]) -> Result<AssistantTurn, ProxyError> {
-    let mut turn = AssistantTurn::default();
-    for item in output {
-        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-        match item_type {
-            "reasoning" => {
-                if let Some(summary) = item
-                    .get("summary")
-                    .and_then(Value::as_array)
-                    .and_then(|items| items.first())
-                    .and_then(|item| item.get("text"))
-                    .and_then(Value::as_str)
-                {
-                    turn.reasoning = summary.to_owned();
-                }
-            }
-            "message" => {
-                if let Some(content) = item.get("content") {
-                    turn.text = crate::translate::extract_message_text(content)?;
-                }
-            }
-            "function_call" => {
-                let call_id = item.get("call_id").and_then(Value::as_str).ok_or_else(|| {
-                    ProxyError::Internal("stored function_call missing call_id".to_owned())
-                })?;
-                let name = item.get("name").and_then(Value::as_str).ok_or_else(|| {
-                    ProxyError::Internal("stored function_call missing name".to_owned())
-                })?;
-                let arguments = item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                turn.tool_calls.push(ToolCall {
-                    call_id: call_id.to_owned(),
-                    name: name.to_owned(),
-                    arguments,
-                });
-            }
-            _ => {}
-        }
-    }
-    Ok(turn)
-}
-
-pub(crate) fn context_from_response(response: &Value) -> Result<RequestContext, ProxyError> {
-    let output = response.get("output").and_then(Value::as_array);
-    Ok(RequestContext {
-        response_id: response
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ProxyError::Internal("stored response missing id".to_owned()))?
-            .to_owned(),
-        reasoning_id: output
-            .and_then(|items| {
-                items.iter().find_map(|item| {
-                    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
-                        item.get("id").and_then(Value::as_str)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .unwrap_or("rs_cancelled")
-            .to_owned(),
-        message_id: output
-            .and_then(|items| {
-                items.iter().find_map(|item| {
-                    if item.get("type").and_then(Value::as_str) == Some("message") {
-                        item.get("id").and_then(Value::as_str)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .unwrap_or("msg_cancelled")
-            .to_owned(),
-        created_at: response
-            .get("created_at")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| ProxyError::Internal("stored response missing created_at".to_owned()))?,
-        client_model: response
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned(),
-        upstream_model: String::new(),
-        stream: false,
-        store: response
-            .get("store")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-        parallel_tool_calls: response
-            .get("parallel_tool_calls")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-        instructions: response
-            .get("instructions")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        metadata: response
-            .get("metadata")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
-        tool_choice: response
-            .get("tool_choice")
-            .cloned()
-            .unwrap_or_else(|| json!("auto")),
-        tools: response
-            .get("tools")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
-        max_output_tokens: response.get("max_output_tokens").and_then(Value::as_u64),
-        max_tool_calls: response
-            .get("max_tool_calls")
-            .and_then(Value::as_u64)
-            .map(|v| v as u32),
-        hosted_output_items: Vec::new(),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use axum::{
-        Json, Router,
-        body::Body,
-        extract::{Path, Request, State},
-        http::{HeaderMap, StatusCode},
-        response::sse::Event,
-        routing::post,
-    };
-    use http_body_util::BodyExt;
-    use tower::ServiceExt;
-
-    use super::*;
-    use crate::handlers::{authorize, cancel_response};
-    use crate::stream::{SseParser, StreamState, apply_stream_delta, parse_sse_event};
+use crate::tools::ToolExecutor;
+use crate::translate::{AssistantTurn, RequestContext, ToolCall};
+use crate::upstream::UpstreamClient;
 
     fn settings(upstream_base_url: String, image_input: bool) -> Settings {
         Settings {
@@ -803,6 +58,7 @@ mod tests {
             max_auto_tool_rounds: 8,
             upstream_max_retries: 0,
             upstream_retry_base_delay_ms: 0,
+            upstream_reasoning_effort_field: "reasoning_effort".to_owned(),
             web_search_url: None,
             web_search_max_results: 5,
             file_search_paths: Vec::new(),
@@ -816,6 +72,7 @@ mod tests {
             supports_tool_choice_required: false,
             supports_reasoning_content: false,
             supports_image_input: image_input,
+            supports_reasoning_effort: false,
         }
     }
 
@@ -1304,12 +561,128 @@ mod tests {
                 .uri("/v1/responses")
                 .header("authorization", "Bearer proxy-secret")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"input":"x","reasoning":{}}).to_string()))
+                .body(Body::from(json!({"input":"x","background":true}).to_string()))
                 .expect("request"),
         )
         .await;
         assert_eq!(strict_response.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn stream_previous_response_id_chains_messages() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                async move {
+                    let is_stream = payload.get("stream").and_then(Value::as_bool) == Some(true);
+                    if is_stream {
+                        // First request: streaming, returns "seed answer"
+                        let stream = stream! {
+                            yield Ok::<Event, Infallible>(Event::default().data(
+                                r#"{"choices":[{"delta":{"content":"seed answer"}}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#
+                            ));
+                            yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+                        };
+                        Sse::new(stream).into_response()
+                    } else {
+                        // Second request: non-stream, verify chained messages
+                        let messages = payload["messages"].as_array().expect("messages");
+                        assert_eq!(messages.len(), 3, "expected 3 messages (seed user + assistant + follow up), got {}", messages.len());
+                        assert_eq!(messages[0]["role"], "user");
+                        assert_eq!(messages[0]["content"], "seed");
+                        assert_eq!(messages[1]["role"], "assistant");
+                        assert_eq!(messages[2]["role"], "user");
+                        assert_eq!(messages[2]["content"], "follow up");
+                        Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "chained reply"
+                                },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let upstream_base_url = spawn_upstream_with_router(upstream).await;
+        let router = build_router(settings(upstream_base_url, false), caps(false));
+
+        // Step 1: streaming request with store: true
+        let stream_response = send(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", "Bearer proxy-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"input":"seed","stream":true,"store":true}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(stream_response.status(), StatusCode::OK);
+
+        // Parse SSE to extract response_id from response.completed event
+        let body = String::from_utf8(
+            stream_response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect")
+                .to_bytes()
+                .to_vec(),
+        )
+        .expect("utf8");
+        assert!(body.contains("event: response.completed"), "stream should complete");
+
+        // Extract response_id from the response.completed data line
+        let response_id = body
+            .lines()
+            .filter(|line| line.starts_with("data: "))
+            .filter_map(|line| {
+                let data = &line[6..];
+                let v: Value = serde_json::from_str(data).ok()?;
+                let resp = v.get("response")?;
+                if v.get("type").and_then(Value::as_str) == Some("response.completed") {
+                    resp.get("id").and_then(Value::as_str).map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+            .next()
+            .expect("should find response_id in stream");
+        assert!(response_id.starts_with("resp_"), "response_id should be valid");
+
+        // Step 2: follow-up non-stream request using previous_response_id
+        let follow_up = send(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", "Bearer proxy-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"input":"follow up","previous_response_id":response_id}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(follow_up.status(), StatusCode::OK);
+        let follow_body = follow_up
+            .into_body()
+            .collect()
+            .await
+            .expect("collect")
+            .to_bytes();
+        let follow_payload: Value = serde_json::from_slice(&follow_body).expect("json");
+        assert_eq!(follow_payload["output_text"], "chained reply");
+    }
+
 
     #[tokio::test]
     async fn tool_execution_round_trip_is_preserved_across_requests() {
@@ -1720,6 +1093,14 @@ mod tests {
             max_output_tokens: None,
             max_tool_calls: None,
             hosted_output_items: Vec::new(),
+            previous_response_id: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+            truncation: "auto".to_owned(),
+            include: Vec::new(),
+            temperature: None,
+            top_p: None,
+            skip_reasoning_output: false,
         };
         let events = finalize_stream_items(&turn, &context, &mut 0);
         assert_eq!(events.len(), 7);
@@ -2062,6 +1443,14 @@ mod tests {
             max_output_tokens: None,
             max_tool_calls: None,
             hosted_output_items: Vec::new(),
+            previous_response_id: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+            truncation: "auto".to_owned(),
+            include: Vec::new(),
+            temperature: None,
+            top_p: None,
+            skip_reasoning_output: false,
         };
         let events = apply_stream_delta(
             &mut state,
@@ -2113,4 +1502,3 @@ mod tests {
         .expect("context");
         assert_eq!(restored.reasoning_id, "rs_cancelled");
     }
-}

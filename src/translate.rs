@@ -38,6 +38,14 @@ pub struct RequestContext {
     pub max_output_tokens: Option<u64>,
     pub max_tool_calls: Option<u32>,
     pub hosted_output_items: Vec<Value>,
+    pub previous_response_id: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_summary: Option<String>,
+    pub truncation: String,
+    pub include: Vec<String>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub skip_reasoning_output: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +78,7 @@ pub fn translate_request(
     capabilities: &Capabilities,
 ) -> Result<TranslatedRequest, ProxyError> {
     validate_text_format(payload)?;
+    validate_reasoning(payload)?;
 
     let client_model =
         optional_string(payload, "model").unwrap_or_else(|| settings.upstream_model.clone());
@@ -82,6 +91,8 @@ pub fn translate_request(
     let max_output_tokens = optional_u64(payload, "max_output_tokens")?
         .and_then(|v| if v == 0 { None } else { Some(v) });
     let max_tool_calls = optional_u64(payload, "max_tool_calls")?.map(|v| v as u32);
+    let previous_response_id = optional_string(payload, "previous_response_id");
+    let truncation = optional_string(payload, "truncation").unwrap_or_else(|| "auto".to_owned());
     let input_items = normalize_input_items(payload.get("input"), settings, capabilities)?;
     let tools = if settings.drop_tools {
         Vec::new()
@@ -96,6 +107,13 @@ pub fn translate_request(
             .cloned()
             .unwrap_or_else(|| Value::String("auto".to_owned()))
     };
+
+    let (reasoning_effort, reasoning_summary) = parse_reasoning_params(payload)?;
+    let skip_reasoning_output = reasoning_summary.is_none() && payload.get("reasoning").is_some();
+    let include = parse_include_array(payload);
+    let temperature = payload.get("temperature").and_then(Value::as_f64);
+    let top_p = payload.get("top_p").and_then(Value::as_f64);
+    let include_requests_logprobs = include.iter().any(|item| item.contains("logprobs"));
 
     let messages = build_messages(
         previous_messages,
@@ -127,6 +145,15 @@ pub fn translate_request(
     if let Some(top_logprobs) = optional_u64(payload, "top_logprobs")? {
         upstream.insert("logprobs".to_owned(), Value::Bool(true));
         upstream.insert("top_logprobs".to_owned(), json!(top_logprobs));
+    } else if include_requests_logprobs {
+        upstream.insert("logprobs".to_owned(), Value::Bool(true));
+        upstream.insert("top_logprobs".to_owned(), json!(5));
+    }
+    if let Some(ref effort) = reasoning_effort {
+        upstream.insert(
+            settings.upstream_reasoning_effort_field.clone(),
+            Value::String(effort.clone()),
+        );
     }
     if !tools.is_empty() {
         upstream.insert("tools".to_owned(), Value::Array(tools.clone()));
@@ -153,6 +180,14 @@ pub fn translate_request(
         max_output_tokens,
         max_tool_calls,
         response_id,
+        previous_response_id,
+        reasoning_effort,
+        reasoning_summary,
+        truncation,
+        include,
+        temperature,
+        top_p,
+        skip_reasoning_output,
         hosted_output_items: Vec::new(),
     };
 
@@ -484,6 +519,64 @@ pub(crate) fn stringify_json_value(value: &Value) -> Result<String, ProxyError> 
         _ => serde_json::to_string(value)
             .map_err(|err| ProxyError::Internal(format!("failed to encode JSON value: {err}"))),
     }
+}
+
+
+fn validate_reasoning(payload: &Map<String, Value>) -> Result<(), ProxyError> {
+    let Some(reasoning) = payload.get("reasoning") else {
+        return Ok(());
+    };
+    let Some(map) = reasoning.as_object() else {
+        return Err(ProxyError::bad_request("reasoning must be a JSON object"));
+    };
+    if let Some(effort) = map.get("effort") {
+        let effort_str = effort
+            .as_str()
+            .ok_or_else(|| ProxyError::bad_request("reasoning.effort must be a string"))?;
+        if !matches!(effort_str, "high" | "medium" | "low") {
+            return Err(ProxyError::bad_request(format!(
+                "reasoning.effort must be \"high\", \"medium\", or \"low\", got \"{effort_str}\""
+            )));
+        }
+    }
+    if let Some(summary) = map.get("summary") {
+        if !summary.is_null() {
+            let summary_str = summary
+                .as_str()
+                .ok_or_else(|| ProxyError::bad_request("reasoning.summary must be a string or null"))?;
+            if !matches!(summary_str, "auto" | "concise" | "detailed") {
+                return Err(ProxyError::bad_request(format!(
+                    "reasoning.summary must be \"auto\", \"concise\", \"detailed\", or null, got \"{summary_str}\""
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_reasoning_params(
+    payload: &Map<String, Value>,
+) -> Result<(Option<String>, Option<String>), ProxyError> {
+    let Some(reasoning) = payload.get("reasoning") else {
+        return Ok((None, None));
+    };
+    let Some(map) = reasoning.as_object() else {
+        return Ok((None, None));
+    };
+    let effort = map.get("effort").and_then(Value::as_str).map(str::to_owned);
+    let summary = if let Some(val) = map.get("summary") {
+        if val.is_null() { None } else { val.as_str().map(str::to_owned) }
+    } else {
+        None
+    };
+    Ok((effort, summary))
+}
+
+fn parse_include_array(payload: &Map<String, Value>) -> Vec<String> {
+    let Some(Value::Array(arr)) = payload.get("include") else {
+        return Vec::new();
+    };
+    arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()
 }
 
 fn validate_text_format(payload: &Map<String, Value>) -> Result<(), ProxyError> {

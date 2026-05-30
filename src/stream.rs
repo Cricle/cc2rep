@@ -111,6 +111,14 @@ pub(crate) fn stream_round_context() -> RequestContext {
         max_output_tokens: None,
         max_tool_calls: None,
         hosted_output_items: Vec::new(),
+        previous_response_id: None,
+        reasoning_effort: None,
+        reasoning_summary: None,
+        truncation: "auto".to_owned(),
+        include: Vec::new(),
+        temperature: None,
+        top_p: None,
+        skip_reasoning_output: false,
     }
 }
 

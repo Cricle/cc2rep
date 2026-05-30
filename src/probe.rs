@@ -12,6 +12,7 @@ pub struct Capabilities {
     pub supports_tool_choice_required: bool,
     pub supports_reasoning_content: bool,
     pub supports_image_input: bool,
+    pub supports_reasoning_effort: bool,
 }
 
 pub async fn probe_upstream(settings: &Settings) -> Capabilities {
@@ -26,6 +27,7 @@ pub async fn probe_upstream(settings: &Settings) -> Capabilities {
             .upstream_supports_reasoning_content
             .unwrap_or(false),
         supports_image_input: settings.upstream_supports_image_input,
+        supports_reasoning_effort: false,
     };
 
     // If all auto-detectable fields are already set, skip probing
@@ -194,10 +196,36 @@ pub async fn probe_upstream(settings: &Settings) -> Capabilities {
         }
     }
 
+    // Probe reasoning_effort support
+    {
+        let effort_body = json!({
+            "model": settings.upstream_model,
+            "messages": [{"role": "user", "content": "1+1?"}],
+            "max_tokens": 16,
+            "reasoning_effort": "low",
+            "stream": false
+        });
+        match client.post(&url).headers(headers.clone()).json(&effort_body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                info!("upstream supports reasoning_effort");
+                caps.supports_reasoning_effort = true;
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                info!(status = %status, "upstream does not support reasoning_effort: {body}");
+            }
+            Err(err) => {
+                warn!("reasoning_effort probe failed: {err}");
+            }
+        }
+    }
+
     info!(
         named_tool_choice = caps.supports_named_tool_choice,
         tool_choice_required = caps.supports_tool_choice_required,
         reasoning_content = caps.supports_reasoning_content,
+        reasoning_effort = caps.supports_reasoning_effort,
         image_input = caps.supports_image_input,
         "probed upstream capabilities"
     );
