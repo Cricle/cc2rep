@@ -15,6 +15,54 @@ pub struct Capabilities {
     pub supports_reasoning_effort: bool,
 }
 
+/// Result of a probe operation, with human-readable labels.
+#[derive(Debug, Clone)]
+pub struct ProbeReport {
+    pub named_tool_choice: bool,
+    pub tool_choice_required: bool,
+    pub reasoning_content: bool,
+    pub reasoning_effort: bool,
+    pub image_input: bool,
+}
+
+impl ProbeReport {
+    pub fn from_caps(caps: &Capabilities, settings: &Settings) -> Self {
+        Self {
+            named_tool_choice: caps.supports_named_tool_choice,
+            tool_choice_required: caps.supports_tool_choice_required,
+            reasoning_content: caps.supports_reasoning_content,
+            reasoning_effort: caps.supports_reasoning_effort,
+            image_input: settings.upstream_supports_image_input,
+        }
+    }
+
+    pub fn print(&self) {
+        println!("Upstream capability probe results:");
+        println!();
+        println!("  {:<35} {}", "named tool_choice", fmt_bool(self.named_tool_choice));
+        println!("  {:<35} {}", "tool_choice: required", fmt_bool(self.tool_choice_required));
+        println!("  {:<35} {}", "reasoning_content", fmt_bool(self.reasoning_content));
+        println!("  {:<35} {}", "reasoning_effort", fmt_bool(self.reasoning_effort));
+        println!("  {:<35} {}", "image input", fmt_bool(self.image_input));
+    }
+}
+
+fn fmt_bool(v: bool) -> &'static str {
+    if v { "yes" } else { "no" }
+}
+
+/// Probe upstream and return a report. Always probes (no skip logic).
+pub async fn probe_report(settings: &Settings) -> (Capabilities, ProbeReport) {
+    // Build capabilities without using config overrides — force full probe
+    let mut probe_settings = settings.clone();
+    probe_settings.upstream_supports_named_tool_choice = None;
+    probe_settings.upstream_supports_tool_choice_required = None;
+    probe_settings.upstream_supports_reasoning_content = None;
+    let caps = probe_upstream(&probe_settings).await;
+    let report = ProbeReport::from_caps(&caps, settings);
+    (caps, report)
+}
+
 pub async fn probe_upstream(settings: &Settings) -> Capabilities {
     let mut caps = Capabilities {
         supports_named_tool_choice: settings

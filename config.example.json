@@ -35,5 +35,9 @@
   },
   "model_aliases": {
     "gpt-5-codex": "deepseek-chat"
-  }
+  },
+  "upstream_supports_reasoning_content": null,
+  "upstream_supports_tool_choice_required": null,
+  "upstream_supports_named_tool_choice": null,
+  "upstream_supports_reasoning_effort": null
 }

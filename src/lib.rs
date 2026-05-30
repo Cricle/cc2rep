@@ -17,4 +17,4 @@ pub mod upstream;
 
 pub use app::build_router;
 pub use config::Settings;
-pub use probe::{Capabilities, probe_upstream};
+pub use probe::{Capabilities, ProbeReport, probe_report, probe_upstream};

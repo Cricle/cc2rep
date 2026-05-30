@@ -192,4 +192,45 @@ mod tests {
         let err = stats_endpoint("   ").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
+
+    #[test]
+    fn probe_config_update_writes_capability_fields() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.probe.json");
+        fs::write(
+            &path,
+            r#"{
+                "proxy_host": "127.0.0.1",
+                "proxy_port": 8800,
+                "proxy_api_key": "key",
+                "upstream_base_url": "https://api.example.com",
+                "upstream_model": "m",
+                "upstream_api_key": "k"
+            }"#,
+        )
+        .unwrap();
+
+        // Simulate what cmd_probe --write does
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let obj = doc.as_object_mut().unwrap();
+        obj.insert("upstream_supports_named_tool_choice".to_owned(), serde_json::json!(true));
+        obj.insert("upstream_supports_tool_choice_required".to_owned(), serde_json::json!(false));
+        obj.insert("upstream_supports_reasoning_content".to_owned(), serde_json::json!(true));
+        obj.insert("upstream_supports_reasoning_effort".to_owned(), serde_json::json!(true));
+        obj.insert("upstream_supports_image_input".to_owned(), serde_json::json!(false));
+        let formatted = serde_json::to_string_pretty(&doc).unwrap();
+        fs::write(&path, formatted + "\n").unwrap();
+
+        // Verify the file is valid JSON and has the new fields
+        let updated: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(updated["upstream_supports_named_tool_choice"], true);
+        assert_eq!(updated["upstream_supports_tool_choice_required"], false);
+        assert_eq!(updated["upstream_supports_reasoning_content"], true);
+        assert_eq!(updated["upstream_supports_reasoning_effort"], true);
+        assert_eq!(updated["upstream_supports_image_input"], false);
+        // Original fields preserved
+        assert_eq!(updated["proxy_host"], "127.0.0.1");
+    }
+
 }

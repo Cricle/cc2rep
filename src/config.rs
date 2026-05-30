@@ -38,6 +38,8 @@ pub struct Settings {
     pub upstream_supports_tool_choice_required: Option<bool>,
     #[serde(default)]
     pub upstream_supports_named_tool_choice: Option<bool>,
+    #[serde(default)]
+    pub upstream_supports_reasoning_effort: Option<bool>,
     #[serde(default = "default_response_ttl_seconds")]
     pub response_ttl_seconds: u64,
     #[serde(default)]
@@ -255,6 +257,7 @@ mod tests {
             upstream_supports_reasoning_content: None,
             upstream_supports_tool_choice_required: None,
             upstream_supports_named_tool_choice: None,
+            upstream_supports_reasoning_effort: None,
             response_ttl_seconds: 3600,
             drop_input_reasoning: false,
             drop_tools: false,

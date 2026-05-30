@@ -202,6 +202,7 @@ mod tests {
             upstream_supports_reasoning_content: None,
             upstream_supports_tool_choice_required: None,
             upstream_supports_named_tool_choice: None,
+            upstream_supports_reasoning_effort: None,
             response_ttl_seconds: 3600,
             drop_input_reasoning: false,
             drop_tools: false,

@@ -11,7 +11,7 @@ use tracing::info;
 use cc2rep::{
     Settings, build_router,
     cli::{ServeConfig, parse_config_selection, prepare_serve_config, stats_endpoint},
-    probe_upstream,
+    probe_report, probe_upstream,
 };
 
 #[derive(Debug, Parser)]
@@ -40,6 +40,15 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8800", value_name = "URL")]
         url: String,
     },
+    /// Probe upstream capabilities and optionally write results to config
+    Probe {
+        /// Path to the config JSON file
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
+        /// Write detected capabilities back to the config file
+        #[arg(short, long)]
+        write: bool,
+    },
 }
 
 #[tokio::main]
@@ -56,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Serve { config } => cmd_serve(config).await,
         Commands::Stats { url } => cmd_stats(url).await,
+        Commands::Probe { config, write } => cmd_probe(config, write).await,
     }
 }
 
@@ -94,6 +104,58 @@ async fn cmd_stats(url: String) -> Result<(), Box<dyn std::error::Error>> {
 
     let stats: Value = resp.json().await?;
     print_stats(&stats);
+    Ok(())
+}
+
+async fn cmd_probe(config: Option<PathBuf>, write: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let config = resolve_serve_config(config)?;
+    let settings = Settings::load(&config)?;
+    println!("Probing upstream: {}", settings.upstream_url());
+    println!("Model: {}", settings.upstream_model);
+    println!();
+
+    let (_caps, report) = probe_report(&settings).await;
+    report.print();
+
+    if write {
+        let raw = std::fs::read_to_string(&config)?;
+        let mut doc: serde_json::Value = serde_json::from_str(&raw)?;
+
+        let obj = doc
+            .as_object_mut()
+            .ok_or("config file must be a JSON object")?;
+
+        obj.insert(
+            "upstream_supports_named_tool_choice".to_owned(),
+            serde_json::json!(report.named_tool_choice),
+        );
+        obj.insert(
+            "upstream_supports_tool_choice_required".to_owned(),
+            serde_json::json!(report.tool_choice_required),
+        );
+        obj.insert(
+            "upstream_supports_reasoning_content".to_owned(),
+            serde_json::json!(report.reasoning_content),
+        );
+        obj.insert(
+            "upstream_supports_reasoning_effort".to_owned(),
+            serde_json::json!(report.reasoning_effort),
+        );
+        obj.insert(
+            "upstream_supports_image_input".to_owned(),
+            serde_json::json!(report.image_input),
+        );
+
+        let formatted = serde_json::to_string_pretty(&doc)?;
+        std::fs::write(&config, formatted + "
+")?;
+        println!();
+        println!("Wrote capabilities to {}", config.display());
+    } else {
+        println!();
+        println!("Run with --write to persist these results to the config file.");
+    }
+
     Ok(())
 }
 
