@@ -51,6 +51,146 @@ fn fmt_bool(v: bool) -> &'static str {
     if v { "yes" } else { "no" }
 }
 
+/// Models discovered from the upstream /models endpoint.
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub id: String,
+}
+
+/// Try to list models from the upstream provider.
+/// Returns a list of model IDs, or empty if the endpoint is not available.
+pub async fn list_models(settings: &Settings) -> Vec<ModelInfo> {
+    let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    let auth_name: reqwest::header::HeaderName = match settings.upstream_api_key_header_name.parse()
+    {
+        Ok(n) => n,
+        Err(_) => reqwest::header::AUTHORIZATION,
+    };
+    let auth_value = format!(
+        "{}{}",
+        settings.upstream_api_key_prefix, settings.upstream_api_key
+    );
+    if let Ok(val) = reqwest::header::HeaderValue::from_str(&auth_value) {
+        headers.insert(auth_name, val);
+    }
+    for (name, value) in &settings.upstream_headers {
+        if let (Ok(n), Ok(v)) = (
+            name.parse::<reqwest::header::HeaderName>(),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            headers.insert(n, v);
+        }
+    }
+
+    // Try /models relative to the base URL (strip /v1 or /chat/completions suffix)
+    let base = settings.upstream_base_url.trim_end_matches('/');
+    let models_url = format!("{}/models", base);
+
+    match client.get(&models_url).headers(headers).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            parse_model_list(&body)
+        }
+        Ok(resp) => {
+            info!(status = %resp.status(), "/models endpoint not available");
+            Vec::new()
+        }
+        Err(err) => {
+            warn!("/models probe failed: {err}");
+            Vec::new()
+        }
+    }
+}
+
+fn parse_model_list(body: &str) -> Vec<ModelInfo> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(data) = value.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    data.iter()
+        .filter_map(|item| {
+            let id = item.get("id").and_then(Value::as_str)?.to_owned();
+            Some(ModelInfo { id })
+        })
+        .collect()
+}
+
+/// Suggest model aliases based on available models and the configured upstream model.
+/// Returns a map of well-known model names → actual upstream model ID.
+pub fn suggest_aliases(models: &[ModelInfo], upstream_model: &str) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut aliases = HashMap::new();
+
+    if models.is_empty() {
+        return aliases;
+    }
+
+    // Find the best chat model and reasoning model
+    let chat_model = find_chat_model(models, upstream_model);
+    let reasoning_model = find_reasoning_model(models, upstream_model);
+
+    // Common model names that clients might request
+    let chat_names = ["gpt-5-codex", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"];
+    let reasoning_names = ["o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini", "deepseek-reasoner"];
+
+    for name in chat_names {
+        if name != chat_model {
+            aliases.insert(name.to_owned(), chat_model.to_owned());
+        }
+    }
+    for name in reasoning_names {
+        if reasoning_model != chat_model {
+            // Only add reasoning aliases if there's a distinct reasoning model
+            if name != reasoning_model {
+                aliases.insert(name.to_owned(), reasoning_model.to_owned());
+            }
+        } else if name != chat_model {
+            aliases.insert(name.to_owned(), chat_model.to_owned());
+        }
+    }
+
+    aliases
+}
+
+fn find_chat_model(models: &[ModelInfo], upstream_model: &str) -> String {
+    // If the upstream_model is in the list, use it
+    if models.iter().any(|m| m.id == upstream_model) {
+        return upstream_model.to_owned();
+    }
+    // Otherwise pick the first non-reasoning model
+    models
+        .iter()
+        .find(|m| !is_reasoning_model(&m.id))
+        .or_else(|| models.first())
+        .map(|m| m.id.clone())
+        .unwrap_or_else(|| upstream_model.to_owned())
+}
+
+fn find_reasoning_model(models: &[ModelInfo], upstream_model: &str) -> String {
+    // Look for a reasoning model
+    if let Some(m) = models.iter().find(|m| is_reasoning_model(&m.id)) {
+        return m.id.clone();
+    }
+    // Fall back to chat model
+    find_chat_model(models, upstream_model)
+}
+
+fn is_reasoning_model(id: &str) -> bool {
+    let lower = id.to_lowercase();
+    lower.contains("reasoner")
+        || lower.contains("r1")
+        || lower.contains("thinking")
+        || lower.contains("-o1")
+        || lower.contains("-o3")
+}
+
 /// Probe upstream and return a report. Always probes (no skip logic).
 pub async fn probe_report(settings: &Settings) -> (Capabilities, ProbeReport) {
     // Build capabilities without using config overrides — force full probe
@@ -306,3 +446,64 @@ fn check_reasoning_support(body: &str, caps: &mut Capabilities) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_model_list_extracts_ids() {
+        let body = r#"{"data":[{"id":"deepseek-chat","object":"model"},{"id":"deepseek-reasoner","object":"model"}]}"#;
+        let models = parse_model_list(body);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "deepseek-chat");
+        assert_eq!(models[1].id, "deepseek-reasoner");
+    }
+
+    #[test]
+    fn parse_model_list_handles_empty_and_invalid() {
+        assert!(parse_model_list("").is_empty());
+        assert!(parse_model_list("{}").is_empty());
+        assert!(parse_model_list(r#"{"data":[]}"#).is_empty());
+    }
+
+    #[test]
+    fn suggest_aliases_maps_common_names() {
+        let models = vec![
+            ModelInfo { id: "deepseek-chat".to_owned() },
+            ModelInfo { id: "deepseek-reasoner".to_owned() },
+        ];
+        let aliases = suggest_aliases(&models, "deepseek-chat");
+        assert_eq!(aliases.get("gpt-5-codex").unwrap(), "deepseek-chat");
+        assert_eq!(aliases.get("gpt-4o").unwrap(), "deepseek-chat");
+        // Reasoning model should be mapped to deepseek-reasoner
+        assert_eq!(aliases.get("o1").unwrap(), "deepseek-reasoner");
+    }
+
+    #[test]
+    fn suggest_aliases_single_model() {
+        let models = vec![
+            ModelInfo { id: "mimo-v2.5-pro".to_owned() },
+        ];
+        let aliases = suggest_aliases(&models, "mimo-v2.5-pro");
+        assert_eq!(aliases.get("gpt-5-codex").unwrap(), "mimo-v2.5-pro");
+        // No distinct reasoning model, so o1 maps to the same
+        assert_eq!(aliases.get("o1").unwrap(), "mimo-v2.5-pro");
+    }
+
+    #[test]
+    fn suggest_aliases_empty_models() {
+        let aliases = suggest_aliases(&[], "some-model");
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn is_reasoning_model_detects_variants() {
+        assert!(is_reasoning_model("deepseek-reasoner"));
+        assert!(is_reasoning_model("deepseek-r1"));
+        assert!(is_reasoning_model("qwen-thinking"));
+        assert!(!is_reasoning_model("deepseek-chat"));
+        assert!(!is_reasoning_model("gpt-4o"));
+    }
+}
+

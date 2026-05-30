@@ -11,7 +11,7 @@ use tracing::info;
 use cc2rep::{
     Settings, build_router,
     cli::{ServeConfig, parse_config_selection, prepare_serve_config, stats_endpoint},
-    probe_report, probe_upstream,
+    list_models, probe_report, probe_upstream, suggest_aliases,
 };
 
 #[derive(Debug, Parser)]
@@ -114,8 +114,46 @@ async fn cmd_probe(config: Option<PathBuf>, write: bool) -> Result<(), Box<dyn s
     println!("Model: {}", settings.upstream_model);
     println!();
 
-    let (_caps, report) = probe_report(&settings).await;
+    // Probe capabilities and models in parallel
+    let (report_result, models) = tokio::join!(
+        probe_report(&settings),
+        list_models(&settings),
+    );
+    let (_caps, report) = report_result;
+
+    // Print capabilities
     report.print();
+
+    // Print available models
+    println!();
+    if models.is_empty() {
+        println!("Models: (could not retrieve from upstream)");
+    } else {
+        println!("Available models ({}):", models.len());
+        for m in &models {
+            let marker = if m.id == settings.upstream_model { " <-- upstream_model" } else { "" };
+            println!("  {}{}", m.id, marker);
+        }
+    }
+
+    // Suggest aliases
+    let aliases = suggest_aliases(&models, &settings.upstream_model);
+    if !aliases.is_empty() {
+        println!();
+        println!("Suggested model_aliases:");
+        for (from, to) in &aliases {
+            println!("  {} -> {}", from, to);
+        }
+    }
+
+    // Show what still needs manual config
+    println!();
+    println!("Config fields that still need manual setup:");
+    println!("  proxy_api_key              - API key for clients connecting to this proxy");
+    println!("  upstream_api_key           - API key for the upstream provider");
+    if settings.upstream_model.is_empty() && !models.is_empty() {
+        println!("  upstream_model             - choose from available models above");
+    }
 
     if write {
         let raw = std::fs::read_to_string(&config)?;
@@ -125,32 +163,26 @@ async fn cmd_probe(config: Option<PathBuf>, write: bool) -> Result<(), Box<dyn s
             .as_object_mut()
             .ok_or("config file must be a JSON object")?;
 
-        obj.insert(
-            "upstream_supports_named_tool_choice".to_owned(),
-            serde_json::json!(report.named_tool_choice),
-        );
-        obj.insert(
-            "upstream_supports_tool_choice_required".to_owned(),
-            serde_json::json!(report.tool_choice_required),
-        );
-        obj.insert(
-            "upstream_supports_reasoning_content".to_owned(),
-            serde_json::json!(report.reasoning_content),
-        );
-        obj.insert(
-            "upstream_supports_reasoning_effort".to_owned(),
-            serde_json::json!(report.reasoning_effort),
-        );
-        obj.insert(
-            "upstream_supports_image_input".to_owned(),
-            serde_json::json!(report.image_input),
-        );
+        // Write capabilities
+        obj.insert("upstream_supports_named_tool_choice".to_owned(), serde_json::json!(report.named_tool_choice));
+        obj.insert("upstream_supports_tool_choice_required".to_owned(), serde_json::json!(report.tool_choice_required));
+        obj.insert("upstream_supports_reasoning_content".to_owned(), serde_json::json!(report.reasoning_content));
+        obj.insert("upstream_supports_reasoning_effort".to_owned(), serde_json::json!(report.reasoning_effort));
+        obj.insert("upstream_supports_image_input".to_owned(), serde_json::json!(report.image_input));
+
+        // Write model aliases
+        if !aliases.is_empty() {
+            let alias_obj: serde_json::Map<String, serde_json::Value> = aliases
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            obj.insert("model_aliases".to_owned(), serde_json::Value::Object(alias_obj));
+        }
 
         let formatted = serde_json::to_string_pretty(&doc)?;
-        std::fs::write(&config, formatted + "
-")?;
+        std::fs::write(&config, formatted + "\n")?;
         println!();
-        println!("Wrote capabilities to {}", config.display());
+        println!("Wrote capabilities and model_aliases to {}", config.display());
     } else {
         println!();
         println!("Run with --write to persist these results to the config file.");
